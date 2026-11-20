@@ -1,0 +1,941 @@
+/* GTA Classics launch window: one app for the natively recompiled Grand Theft Auto III, Vice City and San Andreas. The
+ * look is the GTA III launch window's (gta3_launcher.m): Steam's library art under the chosen game's logo, the game's
+ * menu amber, a row of tiles (Graphics Options, Saves, Game Files, Updates) and Quit / Play, with a card per game where
+ * GTA III had its strip of Liberty City. Choosing a card changes the art; a game that isn't installed is dimmed.
+ *
+ * This is the app's own executable (Contents/MacOS/GTAClassics), a standalone program like the Homeworld port's
+ * launcher: Play execv()s the chosen game's binary beside it (Contents/MacOS/GTA3, GTAVC, GTASA) in this same process,
+ * so the app in the Dock is the game and macOS keeps Game Mode on. The game is told the choices in its environment:
+ *   DS_NO_LAUNCHER=1                        the game's own launch window (gta3_launcher.m) is not shown again
+ *   DS_DISPLAY=window|fullscreen, DS_NOTCH=around|below   main.m (the game's window)
+ *   GTA_MODE=WxH                            runtime/win32/gta3_mode.c, d3d9.c (the video mode; "" = as set in the game)
+ *   DSR_VSYNC=1|0                           main.m (the Metal layer)
+ *   GTA_WIDESCREEN=1|0, GTA_WIDE_HUD=anchor|center   gta3_mode.c, d3d9.c (Hor+ 3D view, the HUD in its 4:3 shape; the
+ *                                           games' own Widescreen setting follows and changes it)
+ *   GTA_MODES=WxH,...                       d3d9.c (the display's shapes in the games' Resolution lists)
+ *   GTA_DEPTH=32|16                         gta3_mode.c (the mode's colour depth; 16: the renderer's 16-bit look)
+ *   GTA_MSAA=<samples>                      d3d8.inc (GTA III, Vice City), gta3_mode.c (San Andreas' Antialiasing)
+ *   GTA_CONTROLS=classic|modern              gta3_mode.c (the controller's layout: the PS2's, or the Definitive Edition's)
+ *   GTA_FPS=<n>                             gta3_mode.c (the frame limiter; above 30 the high-FPS fixes)
+ *   GTA_LIGHTING=ps2|pc                     renderer.m, gta3_mode.c, d3d9.c (PS2 lighting and colour filter)
+ *   DSR_ANISO=16|4|1                        renderer.m (anisotropic filtering of mipmapped textures; 1 off)
+ *   DS_LOG_FILE=<data>/<BIN>.log            the game's log (stderr goes there too; over 5 MB it moves to <BIN>.old.log)
+ * install.sh writes Contents/Resources/games.plist: each installed game's binary, executable, game and data folders
+ * and the commit it was built from. The choices and the last game are kept in ~/Games/GTAClassics/launcher.plist.
+ * Art: Contents/Resources/art/<gta3|vc|sa>/ (tools/gta_art.py, fetched at install time), else ~/Games/GTAClassics/art/
+ * <id>/ or the game's data folder's art/; without it the titles are written.
+ *
+ * Development: GTAC_LAUNCHER_SHOT=<png> renders the window to an image and exits (GTAC_LAUNCHER_GAME=0/1/2 the chosen
+ * card, also without a shot; GTAC_LAUNCHER_OPEN=1 the Graphics Options panel open, GTAC_LAUNCHER_HOVER=<code> an item lit);
+ * GTAC_LAUNCHER_PLAY=1 presses Play at once; GTAC_LAUNCHER_DRY=1 prints what Play would run instead of running it. */
+#import <Cocoa/Cocoa.h>
+#import <Metal/Metal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static NSColor *accent(void) { return [NSColor colorWithSRGBRed:0.98 green:0.70 blue:0.20 alpha:1]; }       /* the games' menu amber */
+static NSColor *accent_dim(void) { return [NSColor colorWithSRGBRed:0.55 green:0.38 blue:0.12 alpha:1]; }
+static NSColor *text_c(void) { return [NSColor colorWithSRGBRed:0.97 green:0.95 blue:0.91 alpha:1]; }
+static NSColor *dim(void) { return [NSColor colorWithSRGBRed:0.66 green:0.64 blue:0.60 alpha:1]; }
+static NSColor *ink(void) { return [NSColor colorWithSRGBRed:0.03 green:0.04 blue:0.06 alpha:1]; }
+static NSFont *heavy(CGFloat size) { return [NSFont fontWithName:@"Futura-CondensedExtraBold" size:size] ?: [NSFont systemFontOfSize:size weight:NSFontWeightHeavy]; }
+static NSFont *body(CGFloat size, BOOL bold)
+{ return [NSFont fontWithName:bold ? @"AvenirNext-DemiBold" : @"AvenirNext-Medium" size:size] ?: [NSFont systemFontOfSize:size weight:bold ? NSFontWeightSemibold : NSFontWeightRegular]; }
+static void on_main(dispatch_block_t b) { CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, b); CFRunLoopWakeUp(CFRunLoopGetMain()); }
+
+// ---------------------------------------------------------------- the games
+typedef struct {
+    const char *id, *title, *city, *place, *bin, *exe, *dataDir, *folder, *userFiles;
+    CGFloat heroX, heroY; CGFloat r, g, b;                    /* where the hero's crop sits; a colour when there is no art */
+} GameDef;
+static const GameDef GAMES[3] = {
+    {"gta3", "Grand Theft Auto III", "LIBERTY CITY", "Liberty City", "GTA3", "gta3.exe", "GTA3Native", "GTAIII", "GTA3 User Files", 0.78, 0.3, 0.02, 0.21, 0.33},
+    {"vc", "Grand Theft Auto: Vice City", "VICE CITY", "Vice City", "GTAVC", "gta-vc.exe", "GTAVCNative", "Grand Theft Auto Vice City", "GTA Vice City User Files", 0.62, 0.25, 0.45, 0.12, 0.10},
+    {"sa", "Grand Theft Auto: San Andreas", "SAN ANDREAS", "San Andreas", "GTASA", "gta_sa.exe", "GTASANative", "GTA San Andreas", "GTA San Andreas User Files", 0.62, 0.2, 0.50, 0.44, 0.28},
+};
+enum { NGAMES = 3 };
+static const int GAMEBANANA[NGAMES] = {1445, 1431, 935};   /* GameBanana's game ids: the Mods window's browser */
+/* classics_mods.m: the Mods window */
+NSString *gcm_env(NSString *data);
+void gcm_counts(NSString *data, NSUInteger *installed, NSUInteger *on);
+void gcm_show(NSWindow *parent, NSString *title, NSString *gameTag, int gamebanana, NSString *data, NSString *userFiles, NSString *gameDir, void (^changed)(void));
+
+@interface GCGame : NSObject
+@property const GameDef *def; @property BOOL installed;
+@property NSString *game, *data, *built, *binPath, *exePath;   /* the game's folder, its data folder, the commit it was built from */
+@property NSImage *hero, *logo, *card;
+@end
+@implementation GCGame @end
+
+// ---------------------------------------------------------------- settings tiles
+@interface GCTile : NSObject
+@property NSString *title; @property NSArray<NSDictionary *> *choices; @property NSInteger index;
+@property (copy) void (^activate)(void);            /* a tile that runs something instead of cycling */
+@property (copy) NSString *(^summary)(void);        /* a tile showing others' values (Graphics Options) */
+@property (copy) NSDictionary *(^current)(void);    /* a tile whose label and note follow the chosen game */
+@property BOOL wide;
+@end
+@implementation GCTile @end
+
+// ---------------------------------------------------------------- the view
+enum { HIT_NONE = -1, HIT_PLAY = 100, HIT_QUIT = 101, HIT_BACK = 102, HIT_CARD = 200, HIT_TILE = 300, HIT_ROW = 400 };   /* tiles, rows: + 10*k + 0 left / 1 value / 2 right */
+enum { W = 960, H = 660 };
+
+@interface GCLaunchView : NSView
+@property NSArray<GCGame *> *games; @property NSInteger game;
+@property NSArray<GCTile *> *tiles; @property NSInteger hover, pressed, focus;   /* focus: -1 the cards, else a tile */
+@property NSArray<GCTile *> *rows; @property BOOL open; @property NSInteger rowFocus;   /* the Graphics Options panel */
+@property NSString *hint;
+@property (copy) void (^onPlay)(void); @property (copy) void (^onQuit)(void); @property (copy) void (^onChange)(void);
+@end
+
+@implementation GCLaunchView
+- (BOOL)isFlipped { return YES; }
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)e { return YES; }
+- (GCGame *)chosen { return self.games[self.game]; }
+- (NSRect)cardRect:(NSInteger)i { return NSMakeRect(60 + i * 288, 318, 264, 149); }
+- (NSRect)tileRect:(NSInteger)k   /* the tiles in a row (a wide one counts twice) */
+{
+    NSInteger units = 0, at = 0, n = (NSInteger)self.tiles.count;
+    for (NSInteger j = 0; j < n; j++) { if (j == k) at = units; units += self.tiles[j].wide ? 2 : 1; }
+    CGFloat u = (840 - 16 * (units - 1)) / (CGFloat)units;
+    return NSMakeRect(60 + at * (u + 16), 494, self.tiles[k].wide ? 2 * u + 16 : u, 66);
+}
+- (NSRect)playRect { return NSMakeRect(W - 60 - 200, H - 66, 200, 46); }
+- (NSRect)quitRect { return NSMakeRect(W - 60 - 200 - 20 - 150, H - 66, 150, 46); }
+/* rows of 60 points with their notes under them; more than seven: rows of 40, the note of the row in focus at the foot */
+- (BOOL)compact { return self.rows.count > 7; }
+- (BOOL)tight { return self.rows.count > 12; }   /* (the controls' rows too: smaller rows, so the panel stays above the buttons) */
+- (CGFloat)pitch { return self.tight ? 31 : self.rows.count > 10 ? 37 : self.compact ? 40 : 60; }
+- (NSRect)panelRect { CGFloat h = 86 + self.pitch * (CGFloat)self.rows.count + (self.compact ? 34 : 0); return NSMakeRect(130, MAX(30, 486 - h), 700, h); }
+- (NSRect)rowRect:(NSInteger)k { NSRect p = self.panelRect; return NSMakeRect(p.origin.x + 30, p.origin.y + 70 + self.pitch * k, p.size.width - 60, self.pitch - 8); }
+- (NSRect)rowArrow:(NSInteger)k right:(BOOL)right { NSRect r = [self rowRect:k]; CGFloat a = self.tight ? 24 : 30; return NSMakeRect(right ? NSMaxX(r) - 34 : NSMaxX(r) - 330, r.origin.y + (self.tight ? 0 : 3), a, a); }
+- (NSRect)rowValue:(NSInteger)k { NSRect r = [self rowRect:k]; return NSMakeRect(NSMaxX(r) - 300, r.origin.y + (self.tight ? 1 : 4), 262, self.tight ? 24 : 28); }
+- (void)openPanel { self.open = YES; self.rowFocus = 0; self.hover = HIT_NONE; self.needsDisplay = YES; }
+- (void)closePanel { self.open = NO; self.hover = HIT_NONE; self.needsDisplay = YES; }
+- (void)choose:(NSInteger)g { if (g == self.game) return; self.game = g; self.needsDisplay = YES; if (self.onChange) self.onChange(); }
+- (NSInteger)hit:(NSPoint)p
+{
+    if (NSPointInRect(p, self.playRect)) return HIT_PLAY;
+    if (NSPointInRect(p, self.quitRect)) return self.open ? HIT_BACK : HIT_QUIT;
+    if (self.open) {
+        for (NSInteger k = 0; k < (NSInteger)self.rows.count; k++) {
+            if (NSPointInRect(p, [self rowArrow:k right:NO])) return HIT_ROW + 10 * k;
+            if (NSPointInRect(p, [self rowArrow:k right:YES])) return HIT_ROW + 10 * k + 2;
+            if (NSPointInRect(p, [self rowRect:k])) return HIT_ROW + 10 * k + 1;
+        }
+        return NSPointInRect(p, self.panelRect) ? HIT_NONE : HIT_BACK;    /* a click outside the panel closes it */
+    }
+    for (NSInteger i = 0; i < NGAMES; i++) if (NSPointInRect(p, [self cardRect:i])) return HIT_CARD + i;
+    for (NSInteger k = 0; k < (NSInteger)self.tiles.count; k++) if (NSPointInRect(p, [self tileRect:k])) return HIT_TILE + 10 * k + 1;
+    return HIT_NONE;
+}
+- (void)updateTrackingAreas
+{
+    for (NSTrackingArea *t in self.trackingAreas) [self removeTrackingArea:t];
+    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:self.bounds options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect owner:self userInfo:nil]];
+}
+- (void)mouseMoved:(NSEvent *)e { NSInteger h = [self hit:[self convertPoint:e.locationInWindow fromView:nil]]; if (h != self.hover) { self.hover = h; self.needsDisplay = YES; } }
+- (void)mouseExited:(NSEvent *)e { self.hover = HIT_NONE; self.needsDisplay = YES; }
+- (void)mouseDown:(NSEvent *)e
+{
+    NSInteger h = [self hit:[self convertPoint:e.locationInWindow fromView:nil]];
+    if (h >= HIT_CARD && h < HIT_CARD + NGAMES && e.clickCount == 2) { [self choose:h - HIT_CARD]; self.pressed = HIT_NONE; if (self.onPlay) self.onPlay(); return; }   /* double-click: play it */
+    self.pressed = h; self.needsDisplay = YES;
+}
+- (void)mouseUp:(NSEvent *)e
+{
+    NSInteger h = [self hit:[self convertPoint:e.locationInWindow fromView:nil]], p = self.pressed; self.pressed = HIT_NONE; self.needsDisplay = YES;
+    if (h != p || h == HIT_NONE) return;
+    if (h == HIT_PLAY) { if (self.onPlay) self.onPlay(); return; }
+    if (h == HIT_QUIT) { if (self.onQuit) self.onQuit(); return; }
+    if (h == HIT_BACK) { [self closePanel]; return; }
+    if (h >= HIT_ROW) { NSInteger k = (h - HIT_ROW) / 10; self.rowFocus = k; [self stepRow:k by:(h - HIT_ROW) % 10 == 0 ? -1 : 1]; return; }
+    if (h >= HIT_TILE) { NSInteger k = (h - HIT_TILE) / 10; self.focus = k; [self activate:k]; return; }
+    if (h >= HIT_CARD) { self.focus = -1; [self choose:h - HIT_CARD]; }
+}
+- (void)activate:(NSInteger)k
+{
+    if (k < 0 || k >= (NSInteger)self.tiles.count) return;
+    GCTile *t = self.tiles[k]; if (t.activate) t.activate(); self.needsDisplay = YES;
+}
+- (void)stepRow:(NSInteger)k by:(NSInteger)dir
+{
+    GCTile *t = self.rows[k]; NSInteger n = (NSInteger)t.choices.count; t.index = (t.index + dir + n) % n;
+    self.needsDisplay = YES; if (self.onChange) self.onChange();
+}
+- (void)keyDown:(NSEvent *)e
+{
+    if (self.open) {
+        NSInteger rn = (NSInteger)self.rows.count;
+        switch (e.keyCode) {
+        case 0x24: case 0x4c: case 0x35: [self closePanel]; return;                          /* Return, Escape: back */
+        case 0x7b: [self stepRow:self.rowFocus by:-1]; return;
+        case 0x7c: [self stepRow:self.rowFocus by:1]; return;
+        case 0x7e: self.rowFocus = (self.rowFocus + rn - 1) % rn; self.needsDisplay = YES; return;
+        case 0x7d: case 0x30: self.rowFocus = (self.rowFocus + 1) % rn; self.needsDisplay = YES; return;
+        }
+        [super keyDown:e]; return;
+    }
+    NSInteger n = (NSInteger)self.tiles.count;
+    switch (e.keyCode) {
+    case 0x24: case 0x4c: if (self.focus >= 0) { [self activate:self.focus]; return; }        /* Return: the tile, else Play */
+                          if (self.onPlay) self.onPlay(); return;
+    case 0x35: if (self.onQuit) self.onQuit(); return;                                       /* Escape */
+    case 0x7b: [self choose:(self.game + NGAMES - 1) % NGAMES]; return;                     /* left / right: the games */
+    case 0x7c: [self choose:(self.game + 1) % NGAMES]; return;
+    case 0x7e: self.focus = self.focus < 0 ? n - 1 : self.focus - 1; self.needsDisplay = YES; return;   /* up / down: the cards, then each tile */
+    case 0x7d: case 0x30: self.focus = self.focus + 1 >= n ? -1 : self.focus + 1; self.needsDisplay = YES; return;   /* also Tab */
+    }
+    [super keyDown:e];
+}
+
+static void draw_text(NSString *s, NSFont *f, NSColor *c, NSRect r, NSTextAlignment al, NSShadow *sh, CGFloat kern)
+{
+    NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new]; ps.alignment = al; ps.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSMutableDictionary *a = [@{NSFontAttributeName: f, NSForegroundColorAttributeName: c, NSParagraphStyleAttributeName: ps, NSKernAttributeName: @(kern)} mutableCopy];
+    if (sh) a[NSShadowAttributeName] = sh;
+    [s drawInRect:r withAttributes:a];
+}
+static void fill_over(NSRect r) { NSRectFillUsingOperation(r, NSCompositingOperationSourceOver); }
+/* an image filling a rectangle, aspect kept (cropped), focusX/focusY: where the crop sits (0 left/top .. 1 right/bottom) */
+static void draw_cover(NSImage *img, NSRect r, CGFloat fraction, CGFloat focusX, CGFloat focusY)
+{
+    NSSize is = img.size;
+    CGFloat sc = MAX(r.size.width / is.width, r.size.height / is.height), w = r.size.width / sc, h = r.size.height / sc;
+    NSRect from = NSMakeRect((is.width - w) * focusX, (is.height - h) * (1 - focusY), w, h);   /* NSImage rows: bottom-up */
+    [img drawInRect:r fromRect:from operation:NSCompositingOperationSourceOver fraction:fraction respectFlipped:YES hints:@{NSImageHintInterpolation: @(NSImageInterpolationHigh)}];
+}
+static void draw_fit(NSImage *img, NSRect r, CGFloat fraction)           /* aspect kept, inside r, left-aligned */
+{
+    CGFloat sc = MIN(r.size.width / img.size.width, r.size.height / img.size.height), w = img.size.width * sc, h = img.size.height * sc;
+    [img drawInRect:NSMakeRect(r.origin.x, NSMidY(r) - h / 2, w, h) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:fraction respectFlipped:YES hints:@{NSImageHintInterpolation: @(NSImageInterpolationHigh)}];
+}
+static void stroke_rect(NSRect r, NSColor *c, CGFloat w) { [c setStroke]; NSBezierPath *b = [NSBezierPath bezierPathWithRect:NSInsetRect(r, w / 2, w / 2)]; b.lineWidth = w; [b stroke]; }
+- (void)drawButton:(NSRect)r title:(NSString *)title code:(NSInteger)code primary:(BOOL)primary enabled:(BOOL)enabled
+{
+    BOOL hot = self.hover == code && enabled, down = self.pressed == code && enabled;
+    if (primary && !enabled) {   /* Play for a game that isn't installed: the bar, unlit */
+        [[accent_dim() colorWithAlphaComponent:0.45] setFill]; fill_over(r);
+        draw_text(title, heavy(25), [ink() colorWithAlphaComponent:0.75], NSMakeRect(r.origin.x, r.origin.y + 7, r.size.width, 34), NSTextAlignmentCenter, nil, 4);
+    } else if (primary) {   /* the game's amber bar: solid, black lettering */
+        NSShadow *glow = [NSShadow new]; glow.shadowColor = [accent() colorWithAlphaComponent:hot ? 0.75 : 0.4]; glow.shadowBlurRadius = hot ? 22 : 14; glow.shadowOffset = NSZeroSize;
+        [NSGraphicsContext saveGraphicsState]; [glow set];
+        [(down ? accent_dim() : hot ? [NSColor colorWithSRGBRed:1 green:0.80 blue:0.36 alpha:1] : accent()) setFill]; NSRectFill(r);
+        [NSGraphicsContext restoreGraphicsState];
+        draw_text(title, heavy(25), ink(), NSMakeRect(r.origin.x, r.origin.y + 7, r.size.width, 34), NSTextAlignmentCenter, nil, 4);
+    } else {
+        [[NSColor colorWithWhite:0.02 alpha:down ? 0.95 : 0.7] setFill]; fill_over(r);
+        stroke_rect(r, hot ? accent() : [text_c() colorWithAlphaComponent:0.35], hot ? 2 : 1);
+        draw_text(title, heavy(21), hot ? accent() : text_c(), NSMakeRect(r.origin.x, r.origin.y + 10, r.size.width, 30), NSTextAlignmentCenter, nil, 4);
+    }
+}
+- (void)drawArrow:(NSRect)r right:(BOOL)right lit:(BOOL)lit
+{
+    NSBezierPath *p = [NSBezierPath bezierPath]; CGFloat x0 = NSMidX(r) - 4, x1 = NSMidX(r) + 4, y0 = NSMidY(r) - 7, y1 = NSMidY(r) + 7, ym = NSMidY(r);
+    if (right) { [p moveToPoint:NSMakePoint(x0, y0)]; [p lineToPoint:NSMakePoint(x1, ym)]; [p lineToPoint:NSMakePoint(x0, y1)]; }
+    else { [p moveToPoint:NSMakePoint(x1, y0)]; [p lineToPoint:NSMakePoint(x0, ym)]; [p lineToPoint:NSMakePoint(x1, y1)]; }
+    p.lineWidth = 2.5; p.lineCapStyle = NSLineCapStyleSquare; p.lineJoinStyle = NSLineJoinStyleMiter;
+    [(lit ? NSColor.whiteColor : accent()) setStroke]; [p stroke];
+}
+- (void)drawCard:(NSInteger)i shadow:(NSShadow *)sh
+{
+    GCGame *g = self.games[i]; NSRect r = [self cardRect:i];
+    BOOL sel = self.game == i, hot = self.hover == HIT_CARD + i, foc = sel && self.focus == -1;
+    if (sel) {                                                           /* the chosen game: an amber glow behind the card */
+        NSShadow *glow = [NSShadow new]; glow.shadowColor = [accent() colorWithAlphaComponent:foc ? 0.6 : 0.4]; glow.shadowBlurRadius = 22; glow.shadowOffset = NSZeroSize;
+        [NSGraphicsContext saveGraphicsState]; [glow set]; [NSColor.blackColor setFill]; NSRectFill(r); [NSGraphicsContext restoreGraphicsState];
+    }
+    [NSColor.blackColor setFill]; NSRectFill(r);
+    if (g.card) draw_cover(g.card, r, 1, 0.5, 0.5);
+    else { [[NSColor colorWithSRGBRed:g.def->r green:g.def->g blue:g.def->b alpha:1] setFill]; NSRectFill(r); }
+    if (!g.installed) {                                                  /* not installed: the colour taken out */
+        [[NSColor colorWithWhite:0.5 alpha:1] setFill]; NSRectFillUsingOperation(r, NSCompositingOperationSaturation);
+    }
+    NSGradient *foot = [[NSGradient alloc] initWithColorsAndLocations:[ink() colorWithAlphaComponent:0], 0.0, [ink() colorWithAlphaComponent:0.45], 0.5, [ink() colorWithAlphaComponent:0.92], 1.0, nil];
+    [foot drawInRect:NSMakeRect(r.origin.x, NSMidY(r) - 10, r.size.width, r.size.height / 2 + 10) angle:90];
+    CGFloat shade = !g.installed ? (hot ? 0.5 : 0.62) : sel ? 0 : hot ? 0.12 : 0.36;
+    if (shade > 0) { [[ink() colorWithAlphaComponent:shade] setFill]; fill_over(r); }
+    NSRect lr = NSMakeRect(r.origin.x + 12, NSMaxY(r) - 60, 118, 50);
+    if (g.logo) {
+        NSShadow *ls = [NSShadow new]; ls.shadowColor = [NSColor colorWithWhite:0 alpha:0.9]; ls.shadowOffset = NSMakeSize(0, -2); ls.shadowBlurRadius = 6;
+        [NSGraphicsContext saveGraphicsState]; [ls set]; draw_fit(g.logo, lr, g.installed ? (sel || hot ? 1 : 0.8) : 0.55); [NSGraphicsContext restoreGraphicsState];
+    } else draw_text(@(g.def->title).uppercaseString, heavy(16), text_c(), NSMakeRect(lr.origin.x, NSMaxY(r) - 34, r.size.width - 24, 22), NSTextAlignmentLeft, sh, 1.5);
+    draw_text(@(g.def->city), heavy(12), sel ? accent() : g.installed ? text_c() : dim(), NSMakeRect(NSMaxX(r) - 150, NSMaxY(r) - 26, 138, 16), NSTextAlignmentRight, sh, 2.5);
+    if (!g.installed) {                                                  /* a tag across the top */
+        NSRect tag = NSMakeRect(NSMaxX(r) - 124, r.origin.y + 10, 114, 22);
+        [[NSColor colorWithWhite:0 alpha:0.75] setFill]; fill_over(tag); stroke_rect(tag, [dim() colorWithAlphaComponent:0.6], 1);
+        draw_text(@"NOT INSTALLED", heavy(12), dim(), NSMakeRect(tag.origin.x, tag.origin.y + 3, tag.size.width, 16), NSTextAlignmentCenter, nil, 2);
+    }
+    stroke_rect(r, sel ? accent() : hot ? [accent() colorWithAlphaComponent:0.8] : [text_c() colorWithAlphaComponent:0.22], sel ? 3 : hot ? 2 : 1);
+}
+- (void)drawTile:(NSInteger)k shadow:(NSShadow *)sh
+{
+    GCTile *t = self.tiles[k]; NSRect r = [self tileRect:k]; NSDictionary *c = t.current ? t.current() : t.choices[t.index];
+    BOOL hot = self.hover == HIT_TILE + 10 * k + 1, foc = self.focus == k, special = [c[@"accent"] boolValue], off = [c[@"off"] boolValue];
+    [[NSColor colorWithWhite:0.03 alpha:hot ? 0.92 : 0.78] setFill]; fill_over(r);
+    stroke_rect(r, (hot || foc) ? accent() : [text_c() colorWithAlphaComponent:0.16], foc ? 2 : 1);
+    [((hot || foc) ? accent() : accent_dim()) setFill]; NSRectFill(NSMakeRect(r.origin.x, r.origin.y, 4, r.size.height));   /* an amber edge */
+    draw_text(t.title.uppercaseString, heavy(13), (hot || foc) ? accent() : dim(), NSMakeRect(r.origin.x + 4, r.origin.y + 9, r.size.width - 4, 18), NSTextAlignmentCenter, nil, 2.5);
+    NSColor *vc = off ? dim() : special ? accent() : hot ? NSColor.whiteColor : text_c();
+    draw_text(t.summary ? t.summary() : c[@"label"], body(15, YES), vc, NSMakeRect(r.origin.x + 21, r.origin.y + 33, r.size.width - 38, 24), NSTextAlignmentCenter, sh, 0.2);
+}
+- (void)drawPanel:(NSShadow *)sh                        /* Graphics Options: a panel over the window, a row per setting */
+{
+    [[NSColor colorWithWhite:0 alpha:0.66] setFill]; fill_over(NSMakeRect(0, 0, W, H - 90));
+    NSRect p = self.panelRect;
+    NSShadow *glow = [NSShadow new]; glow.shadowColor = [NSColor colorWithWhite:0 alpha:0.9]; glow.shadowBlurRadius = 30; glow.shadowOffset = NSMakeSize(0, -8);
+    [NSGraphicsContext saveGraphicsState]; [glow set]; [[NSColor colorWithSRGBRed:0.05 green:0.05 blue:0.06 alpha:0.98] setFill]; NSRectFill(p); [NSGraphicsContext restoreGraphicsState];
+    [accent() setFill]; NSRectFill(NSMakeRect(p.origin.x, p.origin.y, p.size.width, 50));   /* the game's menu title bar */
+    draw_text([NSString stringWithFormat:@"FOR %s", self.games[self.game].def->place].uppercaseString, heavy(14), [ink() colorWithAlphaComponent:0.7], NSMakeRect(p.origin.x + 30, p.origin.y + 18, 300, 20), NSTextAlignmentLeft, nil, 2.5);
+    draw_text(@"GRAPHICS OPTIONS", heavy(30), ink(), NSMakeRect(p.origin.x + 30, p.origin.y + 6, p.size.width - 60, 40), NSTextAlignmentRight, nil, 3);
+    for (NSInteger k = 0; k < (NSInteger)self.rows.count; k++) {
+        GCTile *t = self.rows[k]; NSRect r = [self rowRect:k]; NSDictionary *c = t.choices[t.index];
+        BOOL hot = self.hover >= HIT_ROW + 10 * k && self.hover <= HIT_ROW + 10 * k + 2, foc = self.rowFocus == k;
+        if (foc || hot) { [[accent() colorWithAlphaComponent:foc ? 0.16 : 0.08] setFill]; fill_over(NSInsetRect(r, -10, -2));   /* the game's highlight band */
+                          if (foc) { [accent() setFill]; NSRectFill(NSMakeRect(r.origin.x - 10, r.origin.y - 2, 4, r.size.height + 4)); } }
+        draw_text(t.title.uppercaseString, heavy(self.tight ? 17 : 21), foc || hot ? accent() : text_c(), NSMakeRect(r.origin.x + 6, r.origin.y + (self.tight ? 2 : 4), 260, self.tight ? 24 : 28), NSTextAlignmentLeft, sh, 2.5);
+        [self drawArrow:[self rowArrow:k right:NO] right:NO lit:self.hover == HIT_ROW + 10 * k];
+        [self drawArrow:[self rowArrow:k right:YES] right:YES lit:self.hover == HIT_ROW + 10 * k + 2];
+        draw_text(c[@"label"], body(self.tight ? 16 : 18, YES), self.hover == HIT_ROW + 10 * k + 1 ? NSColor.whiteColor : text_c(), [self rowValue:k], NSTextAlignmentCenter, sh, 0.3);
+        if (!self.compact) draw_text(c[@"note"] ?: @"", body(12, NO), dim(), NSMakeRect(r.origin.x + 6, r.origin.y + 32, r.size.width - 12, 18), NSTextAlignmentRight, nil, 0);
+        if (k + 1 < (NSInteger)self.rows.count) { [[text_c() colorWithAlphaComponent:0.1] setFill]; fill_over(NSMakeRect(r.origin.x, NSMaxY(r) + 4, r.size.width, 1)); }
+    }
+    if (self.compact) {   /* the note of the row the pointer is on, else the one in focus */
+        NSInteger k = self.hover >= HIT_ROW && self.hover < HIT_ROW + 10 * (NSInteger)self.rows.count ? (self.hover - HIT_ROW) / 10 : self.rowFocus;
+        if (k >= 0 && k < (NSInteger)self.rows.count) {
+            GCTile *t = self.rows[k];
+            draw_text(t.choices[t.index][@"note"] ?: @"", body(13, NO), dim(), NSMakeRect(p.origin.x + 30, NSMaxY(p) - 40, p.size.width - 60, 20), NSTextAlignmentCenter, nil, 0);
+        }
+    }
+}
+- (NSString *)cardHint:(NSInteger)i
+{
+    GCGame *g = self.games[i];
+    if (!g.installed) return [NSString stringWithFormat:@"%s isn't installed: ./install.sh --games %s", g.def->place, g.def->id];
+    return [NSString stringWithFormat:@"%s · double-click or Return to play", g.def->title];
+}
+- (NSString *)currentHint
+{
+    if (self.open) return @"←/→ change  ·  ↑/↓ move  ·  Return or Esc goes back";
+    if (self.hover >= HIT_CARD && self.hover < HIT_CARD + NGAMES) return [self cardHint:self.hover - HIT_CARD];
+    NSInteger k = -1;
+    if (self.hover >= HIT_TILE && self.hover < HIT_ROW) k = (self.hover - HIT_TILE) / 10; else if (self.hover == HIT_NONE && self.focus >= 0) k = self.focus;
+    if (k >= 0 && k < (NSInteger)self.tiles.count) { GCTile *t = self.tiles[k]; return (t.current ? t.current() : t.choices[t.index])[@"note"]; }
+    if (self.hover == HIT_PLAY && !self.chosen.installed) return [self cardHint:self.game];
+    return self.hint;
+}
+- (void)drawRect:(NSRect)dirty
+{
+    NSRect b = self.bounds; GCGame *g = self.chosen;
+    NSShadow *sh = [NSShadow new]; sh.shadowColor = [NSColor colorWithWhite:0 alpha:0.85]; sh.shadowOffset = NSMakeSize(0, -1); sh.shadowBlurRadius = 3;
+    [ink() setFill]; NSRectFill(b);
+    /* the chosen game's Steam library art across the top; it fades into the dark below and behind the logo */
+    NSRect band = NSMakeRect(0, 0, W, 360);
+    if (g.hero) draw_cover(g.hero, band, 1, g.def->heroX, g.def->heroY);
+    else { [[NSColor colorWithSRGBRed:g.def->r green:g.def->g blue:g.def->b alpha:1] setFill]; NSRectFill(band); }
+    if (!g.installed) { [[NSColor colorWithWhite:0.5 alpha:1] setFill]; NSRectFillUsingOperation(band, NSCompositingOperationSaturation);
+                        [[ink() colorWithAlphaComponent:0.35] setFill]; fill_over(band); }
+    NSGradient *left = [[NSGradient alloc] initWithColorsAndLocations:[ink() colorWithAlphaComponent:0.92], 0.0, [ink() colorWithAlphaComponent:0.55], 0.42, [ink() colorWithAlphaComponent:0], 0.7, nil];
+    [left drawInRect:band angle:0];
+    NSGradient *foot = [[NSGradient alloc] initWithColorsAndLocations:[ink() colorWithAlphaComponent:0], 0.0, [ink() colorWithAlphaComponent:0.7], 0.6, ink(), 1.0, nil];
+    [foot drawInRect:NSMakeRect(0, 150, W, 212) angle:90];
+    /* the logo and what this is */
+    if (g.logo) {
+        NSShadow *ls = [NSShadow new]; ls.shadowColor = [NSColor colorWithWhite:0 alpha:0.9]; ls.shadowOffset = NSMakeSize(0, -4); ls.shadowBlurRadius = 14;
+        [NSGraphicsContext saveGraphicsState]; [ls set]; draw_fit(g.logo, NSMakeRect(56, 30, 330, 190), 1); [NSGraphicsContext restoreGraphicsState];
+    } else draw_text(@(g.def->title).uppercaseString, heavy(46), text_c(), NSMakeRect(60, 100, 700, 60), NSTextAlignmentLeft, sh, 2);
+    [accent() setFill]; NSRectFill(NSMakeRect(60, 240, 4, 38));
+    draw_text(@"NATIVE FOR APPLE SILICON", heavy(19), text_c(), NSMakeRect(74, 238, 420, 24), NSTextAlignmentLeft, sh, 2.5);
+    NSString *tag = g.installed ? [NSString stringWithFormat:@"%s on Metal · your Steam copy, recompiled", g.def->place]
+                                : [NSString stringWithFormat:@"Not installed · ./install.sh --games %s", g.def->id];
+    draw_text(tag, body(13, NO), accent(), NSMakeRect(74, 261, 520, 20), NSTextAlignmentLeft, sh, 0.3);
+    /* the games */
+    draw_text(@"THE CLASSICS", heavy(13), dim(), NSMakeRect(60, 296, 300, 18), NSTextAlignmentLeft, nil, 3);
+    draw_text(@(g.def->title).uppercaseString, heavy(13), accent(), NSMakeRect(W - 60 - 500, 296, 500, 18), NSTextAlignmentRight, nil, 3);
+    NSInteger hov = self.hover, foc = self.focus; if (self.open) self.hover = self.focus = HIT_NONE;   /* under the panel: nothing lit */
+    for (NSInteger i = 0; i < NGAMES; i++) [self drawCard:i shadow:sh];
+    for (NSInteger k = 0; k < (NSInteger)self.tiles.count; k++) [self drawTile:k shadow:sh];
+    self.hover = hov; self.focus = foc;
+    [[text_c() colorWithAlphaComponent:0.12] setFill]; fill_over(NSMakeRect(60, H - 90, 840, 1));
+    if (self.open) [self drawPanel:sh];
+    NSString *hint = [self currentHint];
+    if (hint.length) draw_text(hint, body(12.5, NO), dim(), NSMakeRect(60, H - 58, 420, 36), NSTextAlignmentLeft, sh, 0.2);
+    [self drawButton:self.quitRect title:self.open ? @"BACK" : @"QUIT" code:self.open ? HIT_BACK : HIT_QUIT primary:NO enabled:YES];
+    [self drawButton:self.playRect title:@"PLAY" code:HIT_PLAY primary:YES enabled:g.installed];
+}
+@end
+
+// ---------------------------------------------------------------- updates (the other ports' updater)
+enum { UPD_NONE, UPD_CHECKING, UPD_CURRENT, UPD_AVAILABLE, UPD_ERROR };
+static NSString *short_commit(NSString *c) { return c.length > 7 ? [c substringToIndex:7] : (c ?: @""); }
+static NSString *update_check(NSString *updater)     /* the newest commit of the branch on GitHub; nil if it can't be reached */
+{
+    NSTask *t = [NSTask new]; t.executableURL = [NSURL fileURLWithPath:@"/bin/bash"]; t.arguments = @[updater, @"--check"];
+    NSPipe *p = [NSPipe pipe]; t.standardOutput = p; t.standardError = [NSFileHandle fileHandleWithNullDevice];
+    if (![t launchAndReturnError:nil]) return nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{ if (t.running) [t terminate]; });
+    NSData *d = [p.fileHandleForReading readDataToEndOfFile]; [t waitUntilExit];
+    NSString *out = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return t.terminationStatus == 0 && out.length >= 40 ? [out substringToIndex:40] : nil;
+}
+static NSArray<NSDictionary *> *update_choice(int state, NSString *branch, NSString *built, NSString *latest)
+{
+    NSString *label = @"Unavailable", *note = @"This copy wasn't installed from the GitHub repository"; BOOL lit = NO;
+    switch (state) {
+    case UPD_CHECKING: label = @"Checking…"; note = [NSString stringWithFormat:@"Asking GitHub for the newest %@", branch]; break;
+    case UPD_CURRENT: label = @"Up to Date"; note = [NSString stringWithFormat:@"%@ %@ · click to check again", branch, short_commit(built)]; break;
+    case UPD_AVAILABLE: label = @"Update Ready"; lit = YES; note = [NSString stringWithFormat:@"%@ → %@: click to install (every installed game is rebuilt)", short_commit(built), short_commit(latest)]; break;
+    case UPD_ERROR: label = @"Can’t Check"; note = @"GitHub unreachable or not signed in: click to retry"; break;
+    }
+    return @[@{@"value": @"", @"label": label, @"note": note, @"accent": @(lit)}];
+}
+static NSString *update_phase(NSString *line, NSString *branch)
+{
+    if ([line hasPrefix:@"== fetching"]) return @"Downloading the update from GitHub";
+    if ([line hasPrefix:[NSString stringWithFormat:@"== %@:", branch]]) return [@"Got " stringByAppendingString:[line substringFromIndex:branch.length + 4]];
+    if ([line hasPrefix:@"== recompiling "]) {                          /* "== recompiling <game> from <folder> (...)" */
+        NSString *rest = [line substringFromIndex:15]; NSRange f = [rest rangeOfString:@" from "];
+        return [NSString stringWithFormat:@"Rebuilding %@ from your copy: translating it to native code", f.location != NSNotFound ? [rest substringToIndex:f.location] : rest];
+    }
+    if ([line hasPrefix:@"== installing"]) return @"Installing the new app";
+    return nil;
+}
+@interface GCBlockTarget : NSObject
+@property (copy) void (^fire)(void);
+- (void)clicked:(id)b;
+@end
+@implementation GCBlockTarget
+- (void)clicked:(id)b { (void)b; if (self.fire) self.fire(); }
+@end
+static BOOL update_run(NSWindow *parent, NSString *updater, NSString *branch, NSString *logPath)   /* modal progress; YES when rebuilt */
+{
+    NSPanel *pn = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 520, 170) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+    pn.title = @"Updating";
+    NSTextField *title = [NSTextField labelWithString:@"Updating to the newest version"]; title.font = [NSFont boldSystemFontOfSize:14]; title.frame = NSMakeRect(20, 128, 480, 22);
+    NSTextField *status = [NSTextField wrappingLabelWithString:@"Starting…"]; status.frame = NSMakeRect(20, 64, 480, 56);
+    NSProgressIndicator *spin = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(20, 44, 480, 12)]; spin.indeterminate = YES; [spin startAnimation:nil];
+    NSTextField *time = [NSTextField labelWithString:@"A few minutes for each game. Your saves and settings are kept."]; time.font = [NSFont systemFontOfSize:11]; time.textColor = NSColor.secondaryLabelColor; time.frame = NSMakeRect(20, 14, 370, 18);
+    NSButton *btn = [NSButton buttonWithTitle:@"Close" target:nil action:nil]; btn.frame = NSMakeRect(400, 8, 100, 30); btn.hidden = YES;
+    for (NSView *x in @[title, status, spin, time, btn]) [pn.contentView addSubview:x];
+    if (parent) [pn setFrameOrigin:NSMakePoint(NSMidX(parent.frame) - 260, NSMidY(parent.frame) - 85)]; else [pn center];
+    [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
+    NSFileHandle *log = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    NSTask *t = [NSTask new]; t.executableURL = [NSURL fileURLWithPath:@"/bin/bash"]; t.arguments = @[updater];
+    NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe; t.standardError = pipe;
+    NSMutableString *pending = [NSMutableString new], *tail = [NSMutableString new];
+    pipe.fileHandleForReading.readabilityHandler = ^(NSFileHandle *h) {
+        NSData *d = h.availableData; if (!d.length) return;
+        [log writeData:d];
+        NSString *chunk = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+        @synchronized (pending) {
+            [pending appendString:chunk]; NSRange nl;
+            while ((nl = [pending rangeOfString:@"\n"]).location != NSNotFound) {
+                NSString *line = [pending substringToIndex:nl.location]; [pending deleteCharactersInRange:NSMakeRange(0, nl.location + 1)];
+                [tail appendFormat:@"%@\n", line]; if (tail.length > 600) [tail deleteCharactersInRange:NSMakeRange(0, tail.length - 600)];
+                NSString *ph = update_phase(line, branch); if (ph) on_main(^{ status.stringValue = ph; });
+            }
+        }
+    };
+    __block BOOL ok = NO;
+    __attribute__((objc_precise_lifetime)) GCBlockTarget *bt = [GCBlockTarget new];   /* a button's target is weak: kept here */
+    bt.fire = ^{ [NSApp stopModal]; }; btn.target = bt; btn.action = @selector(clicked:);
+    t.terminationHandler = ^(NSTask *task) {
+        int code = task.terminationStatus;
+        on_main(^{
+            pipe.fileHandleForReading.readabilityHandler = nil; [log closeFile];
+            [spin stopAnimation:nil]; spin.hidden = YES; btn.hidden = NO;
+            if (code == 0) { ok = YES; title.stringValue = @"Updated"; status.stringValue = @"The new version is installed. The app restarts when you press Restart."; btn.title = @"Restart"; }
+            else {
+                NSString *last; @synchronized (pending) { last = [[tail componentsSeparatedByString:@"\n"] componentsJoinedByString:@" "]; }
+                title.stringValue = @"The update didn't finish";
+                status.stringValue = [NSString stringWithFormat:@"Nothing was changed if it stopped before installing. Details: %@  (%@)", logPath, last.length > 160 ? [last substringFromIndex:last.length - 160] : last];
+                time.stringValue = @"";
+            }
+        });
+    };
+    if (![t launchAndReturnError:nil]) { [log closeFile]; return NO; }
+    [pn makeKeyAndOrderFront:nil]; [NSApp runModalForWindow:pn]; [pn orderOut:nil];
+    return ok;
+}
+
+// ---------------------------------------------------------------- images
+static NSImage *image_at(NSArray<NSString *> *dirs, NSString *name)
+{
+    for (NSString *d in dirs) { NSImage *i = [[NSImage alloc] initWithContentsOfFile:[d stringByAppendingPathComponent:name]]; if (i.size.width > 16) return i; }
+    return nil;
+}
+static NSImage *trimmed(NSImage *img)   /* a logo without its empty margins (Steam's logos sit in 640x360 with differing room) */
+{
+    CGImageRef cg = [img CGImageForProposedRect:NULL context:nil hints:nil]; if (!cg) return img;
+    size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+    uint8_t *px = calloc(w * h, 4); if (!px) return img;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast); CGColorSpaceRelease(cs);
+    if (!ctx) { free(px); return img; }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+    size_t x0 = w, y0 = h, x1 = 0, y1 = 0;
+    for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) if (px[(y * w + x) * 4 + 3] > 8) {
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    CGContextRelease(ctx); free(px);
+    if (x1 <= x0 || y1 <= y0) return img;
+    CGImageRef sub = CGImageCreateWithImageInRect(cg, CGRectMake(x0, y0, x1 - x0 + 1, y1 - y0 + 1));   /* rows from the top */
+    NSImage *out = [[NSImage alloc] initWithCGImage:sub size:NSMakeSize(x1 - x0 + 1, y1 - y0 + 1)]; CGImageRelease(sub);
+    return out;
+}
+
+// ---------------------------------------------------------------- the launcher
+static NSInteger index_of(NSArray<NSDictionary *> *c, id v, NSInteger dflt)
+{ for (NSUInteger k = 0; k < c.count; k++) if ([c[k][@"value"] isEqual:v]) return (NSInteger)k; return dflt; }
+static NSString *val(GCTile *t) { return t.choices[t.index][@"value"]; }
+/* the game's video mode for these choices (gta3_launcher.m mode_for): 4:3, as tall as the screen (below the notch's band
+ * if so) or the window, in points or (Retina) pixels; "" = as set in the game */
+/* the video mode: the display's height (less the notch's band below it, or main.m's 4:3 window), in points or pixels;
+ * 4:3 wide, or with Widescreen the display's own shape */
+/* the picture's shape for the Widescreen choice: the display's own (the area the picture has), 16:9, or 4:3 */
+static double shape_for(NSString *wide, double area)
+{ return [wide isEqualToString:@"off"] ? 4.0 / 3 : [wide isEqualToString:@"16:9"] ? 16.0 / 9 : area; }
+static NSString *wh(double w, double h) { return [NSString stringWithFormat:@"%dx%d", (int)lround(w) & ~1, (int)lround(h) & ~1]; }
+static NSString *fit(double aw, double ah, double shape)   /* the largest size of this shape in aw x ah */
+{ return aw / ah > shape ? wh(floor(ah) * shape, floor(ah)) : wh(floor(aw), floor(aw) / shape); }
+/* The panel's own pixels: a scaled display mode (a MacBook Pro's "More Space", 2056 x 1329 points = 4112 x 2658 pixels)
+ * draws more pixels than the panel has (3456 x 2234) and macOS scales them down. The mode that shows the panel's pixels
+ * one to one at twice its points (macOS's default for the display), if it isn't the current one; *pw, *ph its pixels. */
+static CGDisplayModeRef native_panel_mode(CGDirectDisplayID d, size_t *pw, size_t *ph)
+{
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)@{(__bridge id)kCGDisplayShowDuplicateLowResolutionModes: @YES});
+    if (!modes) return NULL;
+    size_t nw = 0, nh = 0; CFIndex n = CFArrayGetCount(modes);
+    for (CFIndex i = 0; i < n; i++) { CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if ((CGDisplayModeGetIOFlags(m) & 0x02000000) && CGDisplayModeGetPixelWidth(m) > nw) { nw = CGDisplayModeGetPixelWidth(m); nh = CGDisplayModeGetPixelHeight(m); } }   /* kDisplayModeNativeFlag */
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(d), best = NULL; double cr = cur ? CGDisplayModeGetRefreshRate(cur) : 0;
+    for (CFIndex i = 0; nw && i < n; i++) { CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if (CGDisplayModeGetPixelWidth(m) != nw || CGDisplayModeGetPixelHeight(m) != nh || CGDisplayModeGetWidth(m) * 2 != nw || !CGDisplayModeIsUsableForDesktopGUI(m)) continue;
+        if (!best || fabs(CGDisplayModeGetRefreshRate(m) - cr) < fabs(CGDisplayModeGetRefreshRate(best) - cr)) best = m; }
+    if (best && cur && CGDisplayModeGetPixelWidth(cur) == nw && CGDisplayModeGetPixelHeight(cur) == nh) best = NULL;   /* already one to one */
+    if (best) { CGDisplayModeRetain(best); if (pw) *pw = nw; if (ph) *ph = nh; }
+    if (cur) CGDisplayModeRelease(cur); CFRelease(modes);
+    return best;
+}
+static NSString *mode_for(NSString *display, NSString *notch, NSString *res, NSString *wide)
+{
+    if ([res isEqualToString:@"game"]) return @"";
+    NSScreen *s = NSScreen.mainScreen; CGFloat top = 0; if (@available(macOS 12.0, *)) top = s.safeAreaInsets.top;
+    BOOL win = [display isEqualToString:@"window"];
+    CGFloat band = !win && ![notch isEqualToString:@"around"] ? top : 0;
+    double shape = shape_for(wide, s.frame.size.width / (s.frame.size.height - band));   /* the area the picture has */
+    CGFloat w = s.frame.size.width, h = s.frame.size.height - band;
+    if (win) { h = floor(s.visibleFrame.size.height * 0.78) - 28; w = s.visibleFrame.size.width * 0.9; }   /* main.m's window */
+    if ([res isEqualToString:@"native"] && !win) {   /* the panel's pixels (the display switched while the game runs); the notch's
+                                                         band is the same height of glass */
+        size_t pw = 0, ph = 0; CGDisplayModeRef m = native_panel_mode([s.deviceDescription[@"NSScreenNumber"] unsignedIntValue], &pw, &ph);
+        if (m) { CGDisplayModeRelease(m); double k = (double)ph / (s.frame.size.height * s.backingScaleFactor);
+                 return fit(pw, ph - band * s.backingScaleFactor * k, shape_for(wide, pw / (ph - band * s.backingScaleFactor * k))); }
+        res = @"retina";
+    }
+    if ([res isEqualToString:@"retina"] || [res isEqualToString:@"native"]) { w *= s.backingScaleFactor; h *= s.backingScaleFactor; }
+    if (h < 480) return @"640x480";
+    return fit(w, h, shape);
+}
+/* every shape of this display for the games' own Resolution lists: its whole height and below the notch, the display's
+ * shape, 16:9, 16:10 and 4:3, in points and (Retina) pixels */
+static NSString *modes_for_display(void)
+{
+    NSScreen *s = NSScreen.mainScreen; NSMutableOrderedSet *m = [NSMutableOrderedSet orderedSet];
+    CGFloat top = 0; if (@available(macOS 12.0, *)) top = s.safeAreaInsets.top;
+    for (int px = 0; px < (s.backingScaleFactor > 1 ? 2 : 1); px++) {
+        double sc = px ? s.backingScaleFactor : 1, W = s.frame.size.width * sc;
+        for (int below = 0; below < (top > 0 ? 2 : 1); below++) {
+            double Hh = (s.frame.size.height - (below ? top : 0)) * sc;
+            for (NSNumber *a in @[@(W / Hh), @(16.0 / 9), @(16.0 / 10), @(4.0 / 3)]) [m addObject:fit(W, Hh, a.doubleValue)];
+        }
+    }
+    return [m.array componentsJoinedByString:@","];
+}
+static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new]; a.messageText = msg; a.informativeText = info; return a; }
+
+@interface Launcher : NSObject <NSApplicationDelegate>
+@property (strong) NSWindow *window; @property (strong) GCLaunchView *view;
+@property (strong) GCTile *display, *notch, *resolution, *vsync, *wide, *hud, *aa, *aniso, *depth, *fps, *light, *controls, *look, *invert, *updates;
+@property NSString *home, *plistPath;
+@property (strong) NSMutableDictionary *perGame; @property NSInteger settingsGame;   /* every row but Display and Notch is kept for each game */
+@property (strong) NSArray<GCTile *> *gameTiles; @property (strong) NSArray<NSString *> *gameKeys;
+@end
+
+@implementation Launcher
+- (void)applicationDidFinishLaunching:(NSNotification *)n
+{
+    self.home = [NSHomeDirectory() stringByAppendingPathComponent:@"Games/GTAClassics"];
+    self.plistPath = [self.home stringByAppendingPathComponent:@"launcher.plist"];
+    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:self.plistPath] ?: @{};
+    NSString *macos = NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent, *res = NSBundle.mainBundle.resourcePath ?: @"";
+    NSDictionary *installed = [NSDictionary dictionaryWithContentsOfFile:[res stringByAppendingPathComponent:@"games.plist"]] ?: @{};
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    NSMutableArray<GCGame *> *games = [NSMutableArray array];
+    for (int i = 0; i < NGAMES; i++) {
+        const GameDef *d = &GAMES[i]; NSDictionary *e = installed[@(d->id)];
+        GCGame *g = [GCGame new]; g.def = d;
+        g.data = e[@"data"] ?: [NSHomeDirectory() stringByAppendingPathComponent:[@"Games" stringByAppendingPathComponent:@(d->dataDir)]];
+        g.game = e[@"game"] ?: [g.data stringByAppendingPathComponent:[@"game-files" stringByAppendingPathComponent:@(d->folder)]];
+        g.built = e[@"built"] ?: @"";
+        g.binPath = [macos stringByAppendingPathComponent:e[@"bin"] ?: @(d->bin)];
+        g.exePath = [res stringByAppendingPathComponent:e[@"exe"] ?: @(d->exe)];
+        g.installed = e && [fm isExecutableFileAtPath:g.binPath] && [fm fileExistsAtPath:g.exePath];
+        NSArray *art = @[[res stringByAppendingPathComponent:[@"art" stringByAppendingPathComponent:@(d->id)]],
+                         [self.home stringByAppendingPathComponent:[@"art" stringByAppendingPathComponent:@(d->id)]], [g.data stringByAppendingPathComponent:@"art"]];
+        g.hero = image_at(art, @"hero.jpg"); g.card = image_at(art, @"shot1.jpg");
+        NSImage *logo = image_at(art, @"logo.png"); g.logo = logo ? trimmed(logo) : nil;
+        [games addObject:g];
+    }
+
+    GCLaunchView *v = [[GCLaunchView alloc] initWithFrame:NSMakeRect(0, 0, W, H)]; self.view = v;
+    v.hover = v.pressed = HIT_NONE; v.focus = -1; v.games = games;
+    NSInteger first = 0; while (first < NGAMES - 1 && !games[first].installed) first++;
+    v.game = 0; for (int i = 0; i < NGAMES; i++) if ([saved[@"game"] isEqual:@(GAMES[i].id)]) v.game = i;
+    if (!saved[@"game"] || !games[v.game].installed) v.game = games[first].installed ? first : v.game;
+    v.hint = @"←/→ choose a game · ↑/↓ settings · Return plays · Esc quits";
+
+    NSScreen *scr = NSScreen.mainScreen;
+    CGFloat notchH = 0; if (@available(macOS 12.0, *)) notchH = scr.safeAreaInsets.top;
+    GCTile *display = self.display = [GCTile new], *notch = self.notch = [GCTile new], *resTile = self.resolution = [GCTile new], *vsync = self.vsync = [GCTile new];
+    display.title = @"Display";
+    display.choices = @[@{@"value": @"fullscreen", @"label": @"Full Screen", @"note": @"The whole display, the Dock and menu bar out of the way: Game Mode on"},
+                        @{@"value": @"window", @"label": @"Window", @"note": @"A window on the desktop (4:3, resizable); ⌘-Tab and the Dock as usual"}];
+    display.index = index_of(display.choices, saved[@"display"], 0);
+    notch.title = @"Notch";
+    notch.choices = @[@{@"value": @"below", @"label": @"Below It", @"note": @"The picture under the camera housing, the band above it black"},
+                      @{@"value": @"around", @"label": @"Around It", @"note": @"The whole display's height: the notch over the top of the picture"}];
+    notch.index = notchH > 0 ? index_of(notch.choices, saved[@"notch"], 0) : 0;
+    resTile.title = @"Resolution";
+    resTile.choices = @[@{@"value": @"standard", @"label": @"Standard", @"note": [NSString stringWithFormat:@"Display height in points (%@), scaled up by macOS", mode_for(@"fullscreen", @"around", @"standard", @"on")]},
+                        @{@"value": @"retina", @"label": @"Retina", @"note": [NSString stringWithFormat:@"Every pixel (%@ full screen): the sharpest picture", mode_for(@"fullscreen", @"around", @"retina", @"on")]},
+                        @{@"value": @"game", @"label": @"As Set in Game", @"note": @"Each game's own display menu decides (640 × 480 at first)"}];
+    if (scr.backingScaleFactor <= 1) resTile.choices = @[resTile.choices[0], resTile.choices[2]];
+    {   size_t pw = 0, ph = 0; CGDisplayModeRef m = native_panel_mode([scr.deviceDescription[@"NSScreenNumber"] unsignedIntValue], &pw, &ph);
+        if (m) { CGDisplayModeRelease(m);   /* a scaled mode: the panel's own pixels, a mode switch while the game runs */
+            NSMutableArray *c = [resTile.choices mutableCopy];
+            [c insertObject:@{@"value": @"native", @"label": @"Native", @"short": @"Native",
+                              @"note": [NSString stringWithFormat:@"The panel's own %zu × %zu pixels, one to one (the display switches while you play)", pw, ph]} atIndex:2];
+            resTile.choices = c; } }
+    resTile.index = index_of(resTile.choices, saved[@"resolution"], 0);
+    NSInteger hz = scr.maximumFramesPerSecond; if (hz <= 0) hz = 60;
+    vsync.title = @"VSync";
+    vsync.choices = @[@{@"value": @"1", @"label": @"On", @"short": @"VSync", @"note": [NSString stringWithFormat:@"Frames paced to the display's %ld Hz: no tearing", (long)hz]},
+                      @{@"value": @"0", @"label": @"Off", @"short": @"No VSync", @"note": @"Frames shown as soon as they're drawn: lowest latency, may tear"}];
+    vsync.index = index_of(vsync.choices, saved[@"vsync"], 0);
+    GCTile *wide = self.wide = [GCTile new];
+    double shapeFull = scr.frame.size.width / (scr.frame.size.height - notchH);
+    NSString *shapeName = fabs(shapeFull - 16.0 / 10) < 0.02 ? @"16:10" : fabs(shapeFull - 16.0 / 9) < 0.02 ? @"16:9" : [NSString stringWithFormat:@"%.2f:1", shapeFull];
+    wide.title = @"Widescreen";
+    wide.choices = @[@{@"value": @"on", @"label": [NSString stringWithFormat:@"Display (%@)", shapeName], @"short": @"Widescreen",
+                       @"note": @"The display's own shape, filled: a wider view (the 4:3 height kept), the HUD in the corners"},
+                     @{@"value": @"16:9", @"label": @"16:9", @"short": @"16:9",
+                       @"note": fabs(shapeFull - 16.0 / 9) < 0.02 ? @"A true 16:9 picture: a wider view, the HUD in the corners" : @"A true 16:9 picture (thin black bars above and below on this display)"},
+                     @{@"value": @"off", @"label": @"Off (4:3)", @"short": @"4:3", @"note": @"As the games were made: 4:3, black bars at the sides"}];
+    NSString *savedWide = saved[@"wide"]; if ([savedWide isEqual:@"center"]) savedWide = @"on";   /* (an older choice: centred HUD) */
+    wide.index = index_of(wide.choices, savedWide, 0);
+    GCTile *hud = self.hud = [GCTile new];
+    hud.title = @"HUD";
+    hud.choices = @[@{@"value": @"anchor", @"label": @"Corners", @"note": @"Radar, health, money and stars at the screen's corners, in their own shape"},
+                    @{@"value": @"center", @"label": @"Centred 4:3", @"note": @"The HUD in a 4:3 frame in the middle, as on a 4:3 screen"}];
+    hud.index = index_of(hud.choices, saved[@"hud"] ?: ([saved[@"wide"] isEqual:@"center"] ? @"center" : @"anchor"), 0);
+    GCTile *depth = self.depth = [GCTile new];
+    depth.title = @"Colour";
+    depth.choices = @[@{@"value": @"32", @"label": @"32-Bit", @"note": @"Full colour"},
+                      @{@"value": @"16", @"label": @"16-Bit", @"note": @"As a 16-bit screen showed it: fewer colours, dithered (the games' x 16 modes)"}];
+    depth.index = index_of(depth.choices, saved[@"depth"], 0);
+    GCTile *aa = self.aa = [GCTile new];
+    aa.title = @"Anti-Aliasing";
+    {   NSMutableArray *c = [NSMutableArray arrayWithObject:@{@"value": @"1", @"label": @"Off", @"note": @"Edges as drawn"}];
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        for (int n = 2; n <= 8; n *= 2) if ([dev supportsTextureSampleCount:(NSUInteger)n])
+            [c addObject:@{@"value": [NSString stringWithFormat:@"%d", n], @"label": [NSString stringWithFormat:@"%dx MSAA", n],
+                           @"note": n >= 4 ? @"4 samples a pixel: the smoothest edges (an M1 Pro holds about 120 in all three at Retina sizes)"
+                                           : @"2 samples a pixel: smooth edges at little cost (San Andreas: also its own Display Setup)"}];
+        aa.choices = c; }
+    aa.index = index_of(aa.choices, saved[@"aa"], aa.choices.count > 1 ? 1 : 0);   /* 2x unless chosen */
+    GCTile *aniso = self.aniso = [GCTile new];
+    aniso.title = @"Texture Filtering";
+    aniso.choices = @[@{@"value": @"16", @"label": @"16x Anisotropic", @"short": @"16x filtering", @"note": @"Roads and walls seen at a slant: steady into the distance instead of shimmering"},
+                      @{@"value": @"4", @"label": @"4x Anisotropic", @"short": @"4x filtering", @"note": @"Less shimmer at a slant than as released, a little lighter on the GPU"},
+                      @{@"value": @"1", @"label": @"Off (As Released)", @"short": @"Trilinear", @"note": @"As released: distant ground shimmers as you move (San Andreas' own 16x on its main textures stays)"}];
+    aniso.index = index_of(aniso.choices, saved[@"aniso"], 0);
+    GCTile *fps = self.fps = [GCTile new];
+    fps.title = @"Frame Rate";
+    fps.choices = @[@{@"value": @"60", @"label": @"60", @"short": @"60 fps", @"note": @"Twice the original rate, timers and effects at 30's pace (the game's Frame Limiter off: the display's rate)"},
+                    @{@"value": [NSString stringWithFormat:@"%ld", (long)hz], @"label": [NSString stringWithFormat:@"%ld (Display)", (long)hz], @"short": [NSString stringWithFormat:@"%ld fps", (long)hz],
+                      @"note": @"As fast as the display shows: smoothest (San Andreas' physics have quirks this high)"},
+                    @{@"value": @"30", @"label": @"30 (Original)", @"short": @"30 fps", @"note": @"The games' own frame limiter, as released"}];
+    if (hz <= 60) fps.choices = @[fps.choices[0], fps.choices[2]];
+    fps.index = index_of(fps.choices, saved[@"fps"], 0);
+    GCTile *light = self.light = [GCTile new];
+    light.title = @"Lighting";
+    light.choices = @[@{@"value": @"ps2", @"label": @"PS2", @"short": @"PS2 light", @"note": @"As on the PS2: San Andreas' warm colour filter, cars and people lit without washing out"},
+                      @{@"value": @"pc", @"label": @"PC (As Released)", @"short": @"PC light", @"note": @"The PC versions' own lighting and colour filter (brighter, flatter)"}];
+    light.index = index_of(light.choices, saved[@"light"], 0);
+    GCTile *controls = self.controls = [GCTile new];
+    controls.title = @"Controls";
+    controls.choices = @[@{@"value": @"classic", @"label": @"Classic (PS2)", @"short": @"Classic pad",
+                           @"note": @"The PS2's layout: A sprint and accelerate, X jump and brake, B fire, RB target"},
+                         @{@"value": @"modern", @"label": @"Modern", @"short": @"Modern pad",
+                           @"note": @"As the Definitive Edition: RT fire / accelerate, LT aim / brake, RB handbrake, LB/RB weapons"}];
+    controls.index = index_of(controls.choices, saved[@"controls"], 0);
+    GCTile *look = self.look = [GCTile new];
+    look.title = @"Look Speed";
+    look.choices = @[@{@"value": @"900", @"label": @"Slow", @"short": @"Look slow", @"note": @"Modern: the right stick turns the camera slowly (fine aim)"},
+                     @{@"value": @"1400", @"label": @"Normal", @"short": @"Look normal", @"note": @"Modern: how fast the right stick turns the camera"},
+                     @{@"value": @"2000", @"label": @"Fast", @"short": @"Look fast", @"note": @"Modern: a quicker camera"},
+                     @{@"value": @"2800", @"label": @"Very Fast", @"short": @"Look very fast", @"note": @"Modern: the quickest camera"}];
+    look.index = index_of(look.choices, saved[@"look"], 1);
+    GCTile *invert = self.invert = [GCTile new];
+    invert.title = @"Invert Look";
+    invert.choices = @[@{@"value": @"0", @"label": @"Off", @"note": @"Up on the right stick looks up (Classic: as the games did: GTA III and Vice City look down)"},
+                       @{@"value": @"1", @"label": @"On", @"note": @"Up and down on the right stick the other way round, Classic and Modern"}];
+    invert.index = index_of(invert.choices, saved[@"invert"], 0);
+    v.rows = notchH > 0 ? @[display, notch, resTile, depth, wide, hud, aa, aniso, vsync, fps, light, controls, look, invert] : @[display, resTile, depth, wide, hud, aa, aniso, vsync, fps, light, controls, look, invert];
+    /* Every row but Display and Notch is kept for each game (San Andreas may want 2x antialiasing or 60 while GTA III and
+     * Vice City run at 4x and the display's rate), each seeded from the one setting an older launcher kept */
+    self.gameTiles = @[resTile, depth, wide, hud, aa, aniso, vsync, fps, light, controls, look, invert];
+    self.gameKeys = @[@"resolution", @"depth", @"wide", @"hud", @"aa", @"aniso", @"vsync", @"fps", @"light", @"controls", @"look", @"invert"];
+    {   NSDictionary *per = [saved[@"per_game"] isKindOfClass:NSDictionary.class] ? saved[@"per_game"] : @{};
+        NSDictionary *oldFps = [saved[@"fps_by_game"] isKindOfClass:NSDictionary.class] ? saved[@"fps_by_game"] : @{};
+        self.perGame = [NSMutableDictionary new];
+        for (int i = 0; i < NGAMES; i++) {
+            NSString *gid = @(GAMES[i].id);
+            NSMutableDictionary *d = [per[gid] isKindOfClass:NSDictionary.class] ? [per[gid] mutableCopy] : [NSMutableDictionary new];
+            for (NSUInteger k = 0; k < self.gameKeys.count; k++)
+                if (!d[self.gameKeys[k]]) d[self.gameKeys[k]] = [self.gameKeys[k] isEqual:@"fps"] && oldFps[gid] ? oldFps[gid] : val(self.gameTiles[k]);
+            self.perGame[gid] = d;
+        }
+        self.settingsGame = v.game; [self loadGameSettings];
+    }
+
+    GCTile *gfx = [GCTile new]; gfx.title = @"Graphics Options"; gfx.wide = YES;
+    gfx.choices = @[@{@"value": @"", @"label": @"", @"note": @"Display, resolution, colour, widescreen, anti-aliasing, filtering, frame rate, lighting and controls (kept for each game)"}];
+    gfx.summary = ^NSString * {
+        NSMutableArray *a = [NSMutableArray array];
+        for (GCTile *t in @[display, resTile, wide, fps]) [a addObject:t.choices[t.index][@"short"] ?: t.choices[t.index][@"label"]];
+        return [a componentsJoinedByString:@"  ·  "];
+    };
+    __weak GCLaunchView *wv = v; gfx.activate = ^{ [wv openPanel]; };
+    NSString *(^userFiles)(GCGame *) = ^NSString *(GCGame *g) {
+        return [g.data stringByAppendingPathComponent:[@"drive_c/Users/player/Documents" stringByAppendingPathComponent:@(g.def->userFiles)]];
+    };
+    GCTile *saves = [GCTile new]; saves.title = @"Saves";
+    saves.current = ^NSDictionary * {
+        GCGame *g = wv.chosen;
+        if (!g.installed) return @{@"label": @"—", @"off": @YES, @"note": [NSString stringWithFormat:@"%s isn't installed", g.def->place]};
+        return @{@"label": @"Open", @"note": [@"Saved games and settings: " stringByAppendingString:userFiles(g).stringByAbbreviatingWithTildeInPath]};
+    };
+    saves.activate = ^{
+        GCGame *g = wv.chosen; if (!g.installed) { NSBeep(); return; }
+        NSString *u = userFiles(g); [[NSFileManager defaultManager] createDirectoryAtPath:u withIntermediateDirectories:YES attributes:nil error:nil];
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:u isDirectory:YES]];
+    };
+    GCTile *files = [GCTile new]; files.title = @"Game Files";
+    files.current = ^NSDictionary * {
+        GCGame *g = wv.chosen;
+        if (!g.installed) return @{@"label": @"—", @"off": @YES, @"note": [NSString stringWithFormat:@"%s isn't installed", g.def->place]};
+        return @{@"label": @"Open", @"note": [@"The game's own folder (models, audio, skins): " stringByAppendingString:g.game.stringByAbbreviatingWithTildeInPath]};
+    };
+    files.activate = ^{
+        GCGame *g = wv.chosen; if (!g.installed || ![[NSFileManager defaultManager] fileExistsAtPath:g.game]) { NSBeep(); return; }
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:g.game isDirectory:YES]];
+    };
+    GCTile *mods = [GCTile new]; mods.title = @"Mods";
+    mods.current = ^NSDictionary * {
+        GCGame *g = wv.chosen;
+        if (!g.installed) return @{@"label": @"—", @"off": @YES, @"note": [NSString stringWithFormat:@"%s isn't installed", g.def->place]};
+        NSUInteger n = 0, on = 0; gcm_counts(g.data, &n, &on);
+        return @{@"label": n ? [NSString stringWithFormat:@"%lu On", (unsigned long)on] : @"Add Mods",
+                 @"note": n ? [NSString stringWithFormat:@"%lu installed, %lu on: browse GameBanana, install, order and switch them", (unsigned long)n, (unsigned long)on]
+                            : @"Browse GameBanana's mods for this game, or drop in a zip, rar or 7z"};
+    };
+    __weak Launcher *wl = self;
+    mods.activate = ^{
+        GCGame *g = wv.chosen; if (!g.installed) { NSBeep(); return; }
+        NSUInteger k = 0; for (; k < NGAMES; k++) if (&GAMES[k] == g.def) break;
+        gcm_show(wl.window, @(g.def->title), @(g.def->id), k < NGAMES ? GAMEBANANA[k] : 0, g.data, userFiles(g), g.game, ^{ wv.needsDisplay = YES; });
+    };
+    [self setupUpdates];
+    v.tiles = @[gfx, mods, saves, files, self.updates];
+    __weak Launcher *ws = self;
+    v.onPlay = ^{ [ws play]; };
+    v.onQuit = ^{ [NSApp terminate:nil]; };
+    v.onChange = ^{ [ws changed]; };
+
+    const char *shot = getenv("GTAC_LAUNCHER_SHOT");
+    if (getenv("GTAC_LAUNCHER_GAME")) { v.game = MAX(0, MIN(NGAMES - 1, atoi(getenv("GTAC_LAUNCHER_GAME")))); self.settingsGame = v.game; [self loadGameSettings]; }   /* development */
+    if (shot) {                                                          /* development: the window as an image */
+        if (getenv("GTAC_LAUNCHER_HOVER")) v.hover = atoi(getenv("GTAC_LAUNCHER_HOVER"));
+        if (getenv("GTAC_LAUNCHER_OPEN")) v.open = YES;
+        NSBitmapImageRep *rep = [v bitmapImageRepForCachingDisplayInRect:v.bounds]; [v cacheDisplayInRect:v.bounds toBitmapImageRep:rep];
+        [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(shot) atomically:YES];
+        exit(0);
+    }
+    NSMenu *bar = [NSMenu new], *appm = [NSMenu new]; NSMenuItem *it = [NSMenuItem new]; it.submenu = appm; [bar addItem:it];
+    [appm addItemWithTitle:@"Quit GTA Classics" action:@selector(terminate:) keyEquivalent:@"q"]; NSApp.mainMenu = bar;
+    NSWindow *w = [[NSWindow alloc] initWithContentRect:v.frame styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskFullSizeContentView
+                                                backing:NSBackingStoreBuffered defer:NO];
+    w.releasedWhenClosed = NO; w.titlebarAppearsTransparent = YES; w.titleVisibility = NSWindowTitleHidden; w.movableByWindowBackground = YES;
+    w.title = @"GTA Classics"; w.backgroundColor = NSColor.blackColor; w.contentView = v;
+    self.window = w; [w center]; [w makeKeyAndOrderFront:nil]; [w makeFirstResponder:v];
+    [NSApp activateIgnoringOtherApps:YES];
+    if (getenv("GTAC_LAUNCHER_PLAY")) dispatch_async(dispatch_get_main_queue(), ^{ [ws play]; });   /* development: Play at once */
+    if (getenv("GTAC_MODS_OPEN")) dispatch_async(dispatch_get_main_queue(), ^{ mods.activate();   /* development: the Mods window (and its browser) */
+        if (getenv("GTAC_MODS_BROWSE")) dispatch_async(dispatch_get_main_queue(), ^{ void gcm_browse(void); gcm_browse(); }); });
+}
+- (void)setupUpdates
+{
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *updater = [NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"update"];
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:updater]) updater = nil;
+    NSString *branch = info[@"GTACBranch"] ?: @"main", *built = info[@"GTACBuilt"] ?: @"";
+    GCTile *u = [GCTile new]; u.title = @"Updates"; self.updates = u;
+    __block int state = updater ? UPD_CHECKING : UPD_NONE; __block NSString *latest = nil;
+    u.choices = update_choice(state, branch, built, nil);
+    __weak GCTile *wu = u; __weak Launcher *ws = self;
+    void (^check)(void) = ^{
+        if (!updater) return;
+        state = UPD_CHECKING; wu.choices = update_choice(state, branch, built, nil); ws.view.needsDisplay = YES;
+        void (^done)(NSString *) = ^(NSString *l) {
+            latest = l; state = !l ? UPD_ERROR : [l isEqualToString:built] ? UPD_CURRENT : UPD_AVAILABLE;
+            wu.choices = update_choice(state, branch, built, l); ws.view.needsDisplay = YES;
+        };
+        if (getenv("GTAC_LAUNCHER_SHOT")) { done(update_check(updater)); return; }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NSString *l = update_check(updater); on_main(^{ done(l); }); });
+    };
+    check();
+    u.activate = ^{
+        if (state == UPD_CHECKING || state == UPD_NONE) return;
+        if (state != UPD_AVAILABLE) { check(); return; }
+        NSAlert *a = alert([NSString stringWithFormat:@"Update to the newest %@?", [branch isEqualToString:@"nightly"] ? @"Nightly" : @"version"],
+                           [NSString stringWithFormat:@"The %@ branch (%@) is downloaded from GitHub and every installed game is rebuilt from your own copy, "
+                            "which takes a few minutes for each. Your saves and settings are kept. The app restarts when it is done.", branch, short_commit(latest)]);
+        [a addButtonWithTitle:@"Update"]; [a addButtonWithTitle:@"Cancel"];
+        if ([a runModal] != NSAlertFirstButtonReturn) return;
+        [[NSFileManager defaultManager] createDirectoryAtPath:ws.home withIntermediateDirectories:YES attributes:nil error:nil];
+        if (update_run(ws.window, updater, branch, [ws.home stringByAppendingPathComponent:@"update.log"])) {
+            NSTask *o = [NSTask new]; o.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"]; o.arguments = @[@"-n", NSBundle.mainBundle.bundlePath];
+            [o launchAndReturnError:nil]; [o waitUntilExit];                /* the rebuilt app is at the same path */
+            exit(0);
+        }
+        check();
+    };
+}
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)a { return YES; }
+- (NSDictionary *)choices
+{
+    return @{@"game": @(GAMES[self.view.game].id), @"display": val(self.display), @"notch": val(self.notch), @"resolution": val(self.resolution), @"vsync": val(self.vsync), @"wide": val(self.wide), @"hud": val(self.hud), @"aa": val(self.aa), @"aniso": val(self.aniso), @"depth": val(self.depth), @"fps": val(self.fps), @"per_game": self.perGame ?: @{}, @"light": val(self.light), @"controls": val(self.controls), @"look": val(self.look), @"invert": val(self.invert)};
+}
+- (void)loadGameSettings   /* the chosen game's rows */
+{
+    NSDictionary *d = self.perGame[@(GAMES[self.view.game].id)];
+    for (NSUInteger k = 0; k < self.gameKeys.count; k++) { GCTile *t = self.gameTiles[k]; t.index = index_of(t.choices, d[self.gameKeys[k]], t.index); }
+}
+- (void)changed   /* a tile or the game changed: the game's own settings shown, or the change kept for it */
+{
+    if (self.view.game != self.settingsGame) { self.settingsGame = self.view.game; [self loadGameSettings]; self.view.needsDisplay = YES; }
+    else { NSMutableDictionary *d = self.perGame[@(GAMES[self.view.game].id)]; for (NSUInteger k = 0; k < self.gameKeys.count; k++) d[self.gameKeys[k]] = val(self.gameTiles[k]); }
+    [self save];
+}
+- (void)save
+{
+    [[NSFileManager defaultManager] createDirectoryAtPath:self.home withIntermediateDirectories:YES attributes:nil error:nil];
+    [self.choices writeToFile:self.plistPath atomically:YES];
+}
+- (void)play
+{
+    [self save];
+    GCGame *g = self.view.chosen; NSFileManager *fm = NSFileManager.defaultManager;
+    if (!g.installed) {
+        [alert([NSString stringWithFormat:@"%s isn't installed", g.def->title],
+               [NSString stringWithFormat:@"Install it from your Steam copy with the project's installer:\n\n./install.sh --games %s\n\n"
+                "The games already in the app are kept.", g.def->id]) runModal];
+        return;
+    }
+    if (![fm fileExistsAtPath:[g.game stringByAppendingPathComponent:@(g.def->exe)]]) {
+        [alert(@"The game files are missing", [NSString stringWithFormat:@"Expected %s in %@. Run install.sh again.", g.def->exe, g.game]) runModal];
+        return;
+    }
+    NSDictionary *c = self.choices;
+    NSString *log = [g.data stringByAppendingPathComponent:[@(g.def->bin) stringByAppendingString:@".log"]];
+    NSDictionary *env = @{@"DS_NO_LAUNCHER": @"1", @"DS_DISPLAY": c[@"display"], @"DS_NOTCH": c[@"notch"], @"DSR_VSYNC": c[@"vsync"],
+                          /* always set, "" for as set in the game: the game's own launch code keeps a value already set,
+                           * and would otherwise take one from an older launcher.plist in its data folder */
+                          @"GTA_MODE": mode_for(c[@"display"], c[@"notch"], c[@"resolution"], c[@"wide"]), @"DS_LOG_FILE": log,
+                          @"GTA_MODS": gcm_env(g.data),    /* the Mods window's enabled mods (runtime/win32/files.c) */
+                          /* gta3_mode.c (the 3D view), d3d9.c (the HUD) */
+                          @"GTA_WIDESCREEN": [c[@"wide"] isEqual:@"off"] ? @"0" : @"1", @"GTA_WIDE_HUD": c[@"hud"],
+                          @"GTA_MODES": modes_for_display(), @"GTA_DEPTH": c[@"depth"],   /* d3d9.c (the games' Resolution lists), gta3_mode.c */
+                          @"GTA_MSAA": c[@"aa"],   /* d3d8.inc (GTA III, Vice City), gta3_mode.c (San Andreas' own setting) */
+                          @"DSR_ANISO": c[@"aniso"],   /* renderer.m: mipmapped textures' anisotropic filtering */
+                          @"GTA_FPS": c[@"fps"],   /* gta3_mode.c: the games' limiter, and the high-FPS fixes above 30 */
+                          @"GTA_LIGHTING": c[@"light"],
+                          @"DS_NATIVE_PANEL": [c[@"resolution"] isEqual:@"native"] && [c[@"display"] isEqual:@"fullscreen"] ? @"1" : @"0",   /* main.m */
+                          @"GTA_CONTROLS": c[@"controls"], @"GTA_STICK_LOOK": c[@"look"], @"GTA_STICK_INVERT": c[@"invert"]};   /* gta3_mode.c gta_pad_layout */   /* renderer.m (lighting), gta3_mode.c + d3d9.c (San Andreas' colour filter) */
+    NSArray<NSString *> *args = @[g.binPath, @"--exe", g.exePath, @"--game", g.game, @"--data", g.data];
+    if (getenv("GTAC_LAUNCHER_DRY")) {                                   /* development: what Play runs */
+        for (NSString *k in [env.allKeys sortedArrayUsingSelector:@selector(compare:)]) printf("%s=%s\n", k.UTF8String, [env[k] UTF8String]);
+        for (NSString *a in args) printf("'%s' ", a.UTF8String);
+        printf("2>>'%s'\n", log.UTF8String); fflush(stdout); exit(0);
+    }
+    /* The game runs in a fresh instance of the app that never shows a window: it execs the game at once (main below).
+     * A full-screen game window from the process that showed this window can stay black and off the front (as in the
+     * Diablo II port), and opened through LaunchServices the instance is still this app, so Game Mode turns on. */
+    NSMutableDictionary *all = [NSProcessInfo.processInfo.environment mutableCopy];
+    [all addEntriesFromDictionary:env];
+    [all addEntriesFromDictionary:@{@"GTAC_PLAY_BIN": g.binPath, @"GTAC_PLAY_EXE": g.exePath, @"GTAC_PLAY_GAME": g.game, @"GTAC_PLAY_DATA": g.data}];
+    [all removeObjectForKey:@"GTAC_LAUNCHER_PLAY"];
+    NSWorkspaceOpenConfiguration *cfg = [NSWorkspaceOpenConfiguration configuration];
+    cfg.createsNewApplicationInstance = YES; cfg.environment = all; cfg.activates = YES;
+    [self.window orderOut:nil];
+    [[NSWorkspace sharedWorkspace] openApplicationAtURL:NSBundle.mainBundle.bundleURL configuration:cfg completionHandler:^(NSRunningApplication *app, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (app) { [NSApp terminate:nil]; return; }
+            [self.window makeKeyAndOrderFront:nil];
+            [alert(@"The game did not start", err.localizedDescription ?: @"") runModal];
+        });
+    }];
+}
+@end
+
+/* the game's instance (see play): straight into the game, its stderr in the game's log (the previous one kept as .old
+ * past 5 MB) */
+static void exec_game(void)
+{
+    const char *bin = getenv("GTAC_PLAY_BIN"), *log = getenv("DS_LOG_FILE");
+    const char *argv[] = {bin, "--exe", getenv("GTAC_PLAY_EXE"), "--game", getenv("GTAC_PLAY_GAME"), "--data", getenv("GTAC_PLAY_DATA"), 0};
+    for (int k = 2; k < 7; k += 2) if (!argv[k]) return;
+    mkdir(argv[6], 0755);
+    if (log) {
+        struct stat st;
+        if (!stat(log, &st) && st.st_size > 5000000) { char old[2048]; snprintf(old, sizeof old, "%.*s.old.log", (int)(strlen(log) - 4), log); rename(log, old); }
+        int fd = open(log, O_WRONLY | O_APPEND | O_CREAT, 0644); if (fd >= 0) { dup2(fd, 2); close(fd); }
+    }
+    char *keep[4]; const char *names[4] = {"GTAC_PLAY_BIN", "GTAC_PLAY_EXE", "GTAC_PLAY_GAME", "GTAC_PLAY_DATA"};
+    for (int k = 0; k < 4; k++) { keep[k] = strdup(getenv(names[k])); }
+    argv[0] = keep[0]; argv[2] = keep[1]; argv[4] = keep[2]; argv[6] = keep[3];
+    for (int k = 0; k < 4; k++) unsetenv(names[k]);
+    execv(argv[0], (char *const *)argv);
+    fprintf(stderr, "GTA Classics: %s did not start: %s\n", argv[0], strerror(errno));
+}
+
+int main(int argc, const char **argv)
+{
+    (void)argc; (void)argv;
+    if (getenv("GTAC_PLAY_BIN")) { exec_game(); return 1; }
+    @autoreleasepool {
+        NSApplication *app = [NSApplication sharedApplication];
+        app.activationPolicy = NSApplicationActivationPolicyRegular;
+        Launcher *l = [Launcher new]; app.delegate = l;
+        [app run];
+    }
+    return 0;
+}

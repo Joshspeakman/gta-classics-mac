@@ -1,0 +1,1376 @@
+// DSR native renderer core: Direct3D 7 fixed-function state + DirectDraw surfaces on Metal.
+#import "renderer.h"
+#import <QuartzCore/QuartzCore.h>
+#include "../dsr/dsr_proto.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+int dsr_verbose; long dsr_stat[8]; double dsr_gpu_ms[100000]; int dsr_frame;
+#define MAXSURF 65536
+/* ms: a multisampled target's samples, resolved into tex as each pass drawing into them ends (tex is what copies, the
+ * present and readbacks read: such surfaces are never bound as textures); ms_dirty: drawn since the last resolve (only
+ * while a pass is open). auxz: its depth when the bound depth buffer has another sample count.
+ * gen/ok/dropped/never [0], the colour samples when they are stored (DSR_MS_KEEP): gen the frame of the first pass into
+ * them, ok the frames in a row whose first pass cleared them, so what the frame's last pass leaves need not be stored at
+ * the present (dropped); a frame that reads them after all stops that for good (never). ([1] is unused: depth is always
+ * stored, since the games' later passes read it.) */
+typedef struct { id<MTLTexture> tex, view2d, ms, auxz, tex_alt; uint32_t w, h, kind, fmt, level, root, slice, samples; int used, fxrt, ms_dirty, ms_tile;
+                 int gen[2], ok[2], dropped[2], never[2]; } Surf;
+/* ms_tile: the colour samples live only in the GPU's tile memory (memoryless): each pass resolves them into tex_alt,
+ * which then becomes tex, and a pass that doesn't start by clearing first draws tex (the picture so far) into them. A
+ * Retina-sized 4x target's samples are 175 MB: stored and loaded around every pass, they were most of a frame's GPU
+ * time; the picture so far is the resolved one anyway (DSR_MS_KEEP=1: stored as before). */   /* fxrt: an effect pass drew into it (DSR_GLOWLOG) */   /* cube faces: tex the cube, view2d the face as 2D */
+static inline id<MTLTexture> tex2d(const void *sp) { const Surf *s = sp; return s->view2d ? s->view2d : s->tex; }
+typedef struct {   // must match shaders.metal Uniforms
+    float wvp[16], wv[16], tex0[16];
+    float vp[4], fog[4], fogcolor[4], tfactor[4];
+    int32_t c0[4], a0[4], c1[4], a1[4];
+    float at[4];
+    int32_t misc[4];
+    int32_t xrgb[4];     // texture stage 0/1 is XRGB (alpha reads as 1)
+    float tex1[16];      // texture-1 transform
+    int32_t s1[4];       // stage 1: texcoordindex, texturetransformflags
+    float nrm[16];       // normal matrix: inverse transpose of world*view
+    float amb[4], md[4], ma[4], ms[4], me[4];   // D3DRS_AMBIENT; material diffuse, ambient, specular, emissive
+    int32_t lit[4];      // lighting on, lights, material sources, normalize normals
+    int32_t tg[4];       // local viewer, specular on, PS2 lighting (GTA_LIGHTING=ps2)
+    float lod[4];        // stage 0/1 mip LOD bias
+    float lt[8 * 7][4];  // lights in camera space (see shaders.metal)
+} Uniforms;
+
+struct DSRRenderer {
+    id<MTLDevice> dev; id<MTLCommandQueue> q; id<MTLLibrary> lib;
+    Surf s[MAXSURF];
+    uint32_t rs[256], tss[8][32]; float xf[32][16]; float vp[6]; uint32_t tex[8];
+    uint32_t rt, ds;
+    id<MTLCommandBuffer> cb, last_cb; id<MTLRenderCommandEncoder> enc; id<MTLBlitCommandEncoder> blit; uint32_t enc_rt, enc_ds, encoders; uint64_t cb_bytes;
+    /* the open pass: its multisampled colour (resolved as it ends) and its own depth surface; a clear that starts it */
+    uint32_t enc_cid, enc_zid; int enc_zu, enc_tile; id<MTLTexture> enc_ms; id<MTLRenderPipelineState> hqr[4][2]; int ending_frame; uint32_t pend_flags, pend_color, pend_stencil; float pend_z;
+    id<MTLBuffer> ring; uint32_t ring_off, ring_size; id<MTLBuffer> white;
+    /* pipeline, depth and sampler states by key: open-addressing tables (keys never 0), no Objective-C boxing per draw */
+    uint64_t pso_k[4096]; id<MTLRenderPipelineState> pso_v[4096];
+    uint64_t fsf_k[1024]; id<MTLFunction> fsf_v[1024]; int fsf_n;   /* fs_main specialised (fs_main_for) */
+    uint64_t dso_k[64]; id<MTLDepthStencilState> dso_v[64];
+    uint32_t smp_k[1024]; id<MTLSamplerState> smp_v[1024]; int pso_n, dso_n, smp_n; uint32_t pso_last;   // filled at most 3/4, then uncached
+    /* the current render encoder's state, so unchanged state isn't set again (cleared with each new encoder) */
+    struct { __unsafe_unretained id pso, dso, tex[2], smp[2]; int cull, ring_bound; uint32_t sref; MTLViewport vp; } es;
+    id<MTLRenderPipelineState> hq[4], hqo[4], hz[4]; int dither16;
+    id<MTLRenderPipelineState> glow_x, glow_b, glow_add[4]; id<MTLTexture> glow_t[2];   /* DSR_GLOW */   /* quad, quad "over", depth clear: by sample count 1, 2, 4, 8 */
+    id<MTLRenderPipelineState> quad_pso, quad_over_pso, zclear_pso, zupload_pso, present_pso; id<MTLTexture> zup_tex; id<MTLTexture> scratch, gamma_lut; uint16_t gamma[3][256]; int gamma_dirty; id<MTLDepthStencilState> zclear_ds, nodepth_ds, zsclear_ds[4];
+    id<MTLSamplerState> point_clamp, linear_clamp; id<MTLTexture> dummy;
+    /* effect programs (DSR_PROG_*): Metal compiled from the game's HLSL effects (runtime/win32/hlsl.c) */
+    struct { id<MTLFunction> vs, fs; uint32_t kinds; } prog[1024]; uint32_t cur_prog;
+    float pconst[4096 * 4]; uint32_t npconst;
+    uint64_t ppso_k[512]; id<MTLRenderPipelineState> ppso_v[512]; int ppso_n;
+    id<MTLBuffer> attr_defaults; id<MTLTexture> dummy_cube, dummy_3d;
+    uint32_t presented;
+    id<MTLBuffer> rb_buf; volatile uint32_t *rb_done;
+    double present_ts;
+    id<MTLRenderPipelineState> graph_pso; const float *g_a, *g_b; int g_ha, g_hb, g_on;
+    /* fixed-function lighting (DSR_MATERIAL, DSR_LIGHT): only for producers that send them (the Direct3D 8/9 layer) */
+    int ff_light; float material[17]; struct { int on; uint32_t type; float v[25]; } light[32];
+    /* the game's own shader pairs (DSR_MSL_CREATE: d3d9_shader.c's MojoShader translation), by id - 0x10000; fs nil:
+     * the fixed-function texture stages (fs_main) finish the vertex shader */
+    struct { id<MTLFunction> vs, fs; uint32_t kinds, nattr; uint8_t reg[16], slot[16]; } mp[4096]; uint32_t cur_mp;   /* index + 1 */
+    uint8_t sconst[2][4096 * 16 + 4096]; uint32_t sconst_n[2]; float salpha[4];   /* the stages' constant structs (DSR_SHADER_CONST) */
+    uint64_t mpso_k[4096]; id<MTLRenderPipelineState> mpso_v[4096]; int mpso_n;
+};
+
+static void mat_ident(float *m) { memset(m, 0, 64); m[0] = m[5] = m[10] = m[15] = 1; }
+static void mat_mul(float *o, const float *a, const float *b)   // D3D row-major: o = a * b
+{
+    float t[16]; for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { float s = 0; for (int k = 0; k < 4; k++) s += a[r * 4 + k] * b[k * 4 + c]; t[r * 4 + c] = s; }
+    memcpy(o, t, 64);
+}
+
+static NSString *shader_source(void)
+{
+    NSString *path = [[[NSProcessInfo processInfo] arguments][0] stringByDeletingLastPathComponent];
+    NSString *src = [NSString stringWithContentsOfFile:[path stringByAppendingPathComponent:@"shaders.metal"] encoding:NSUTF8StringEncoding error:nil];
+    if (!src) src = [NSString stringWithContentsOfFile:@"shaders.metal" encoding:NSUTF8StringEncoding error:nil];
+    return src;
+}
+
+DSRRenderer *dsr_renderer_create(id<MTLDevice> dev)
+{
+    DSRRenderer *r = calloc(1, sizeof *r); NSError *err = nil;
+    r->dev = dev; r->q = [dev newCommandQueue];
+    r->lib = [dev newLibraryWithSource:shader_source() options:nil error:&err];
+    if (!r->lib) { fprintf(stderr, "shader compile failed: %s\n", err.localizedDescription.UTF8String); exit(1); }
+    r->ring_size = 256u << 20;
+    { const char *mb = getenv("DSR_RINGMB"); if (mb && atoi(mb) >= 4 && atoi(mb) <= 256) r->ring_size = (uint32_t)atoi(mb) << 20; } // development: force frequent wraps
+    r->ring = [dev newBufferWithLength:r->ring_size options:MTLResourceStorageModeShared];
+    { uint32_t w[4] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}; r->white = [dev newBufferWithBytes:w length:sizeof w options:MTLResourceStorageModeShared]; }
+    for (int k = 0; k < 32; k++) mat_ident(r->xf[k]);
+    for (int k = 0; k < 256; k++) r->rs[k] = 0;
+    r->rs[168] = 15; r->rs[56] = 8; r->rs[58] = r->rs[59] = 0xff; r->rs[53] = r->rs[54] = r->rs[55] = 1; r->rs[7] = 1; r->rs[14] = 1; r->rs[23] = 4; r->rs[22] = 3; r->rs[19] = 2; r->rs[20] = 1; r->rs[25] = 8;   // ZENABLE, ZWRITE, ZFUNC LEQUAL, CULL CCW, SRC ONE, DST ZERO, AFUNC ALWAYS
+    for (int st = 0; st < 8; st++) { r->tss[st][1] = st ? 1 : 4; r->tss[st][2] = 2; r->tss[st][3] = 1; r->tss[st][4] = st ? 1 : 2; r->tss[st][5] = 2; r->tss[st][6] = 1;
+                                     r->tss[st][11] = st; r->tss[st][13] = r->tss[st][14] = 1; r->tss[st][16] = r->tss[st][17] = 2; r->tss[st][18] = 1; }
+    {   MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [r->lib newFunctionWithName:@"vs_quad"]; d.fragmentFunction = [r->lib newFunctionWithName:@"fs_quad"];
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        r->quad_pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        d.colorAttachments[0].blendingEnabled = YES;   // premultiplied "over" for DSR_UPLOAD_OVER
+        d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        r->quad_over_pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        d.colorAttachments[0].blendingEnabled = NO;
+        d.vertexFunction = [r->lib newFunctionWithName:@"vs_zclear"]; d.fragmentFunction = nil;
+        d.colorAttachments[0].writeMask = MTLColorWriteMaskNone; d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+        r->zclear_pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        d.vertexFunction = [r->lib newFunctionWithName:@"vs_present"]; d.fragmentFunction = [r->lib newFunctionWithName:@"fs_zupload"];
+        r->zupload_pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];   // DSR_DEPTH_UPLOAD: depth from a float texture
+        if (!r->quad_pso || !r->zclear_pso || !r->zupload_pso) { fprintf(stderr, "helper pipelines: %s\n", err.localizedDescription.UTF8String); exit(1); }
+        r->hq[0] = r->quad_pso; r->hqo[0] = r->quad_over_pso; r->hz[0] = r->zclear_pso;
+        MTLDepthStencilDescriptor *z = [MTLDepthStencilDescriptor new]; z.depthCompareFunction = MTLCompareFunctionAlways; z.depthWriteEnabled = YES;
+        r->zclear_ds = [dev newDepthStencilStateWithDescriptor:z];
+        z.depthWriteEnabled = NO; r->nodepth_ds = [dev newDepthStencilStateWithDescriptor:z];
+        for (int k = 1; k < 4; k++) {                       // clears: [1] depth, [2] stencil, [3] both (stencil = the reference value)
+            MTLDepthStencilDescriptor *c = [MTLDepthStencilDescriptor new]; c.depthCompareFunction = MTLCompareFunctionAlways; c.depthWriteEnabled = (k & 1) != 0;
+            if (k & 2) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = MTLCompareFunctionAlways;
+                         sd.depthStencilPassOperation = MTLStencilOperationReplace; sd.writeMask = 0xff; c.frontFaceStencil = c.backFaceStencil = sd; }
+            r->zsclear_ds[k] = [dev newDepthStencilStateWithDescriptor:c];
+        } }
+    {   MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [r->lib newFunctionWithName:@"vs_present"]; d.fragmentFunction = [r->lib newFunctionWithName:@"fs_present"];
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        r->present_pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!r->present_pso) { fprintf(stderr, "present pipeline: %s\n", err.localizedDescription.UTF8String); exit(1); }
+        MTLTextureDescriptor *g = [MTLTextureDescriptor new]; g.textureType = MTLTextureType1D; g.pixelFormat = MTLPixelFormatRGBA16Unorm; g.width = 256;
+        g.storageMode = MTLStorageModeShared; r->gamma_lut = [dev newTextureWithDescriptor:g];
+        for (int k = 0; k < 256; k++) r->gamma[0][k] = r->gamma[1][k] = r->gamma[2][k] = k * 0x101;
+        r->gamma_dirty = 1; }
+    {   MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        r->point_clamp = [dev newSamplerStateWithDescriptor:sd]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; r->linear_clamp = [dev newSamplerStateWithDescriptor:sd]; }
+    {   MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:1 height:1 mipmapped:NO];
+        r->dummy = [dev newTextureWithDescriptor:td];
+        MTLTextureDescriptor *sd2 = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:256 height:256 mipmapped:NO];
+        sd2.storageMode = MTLStorageModePrivate; sd2.usage = MTLTextureUsageShaderRead; r->scratch = [dev newTextureWithDescriptor:sd2]; uint32_t white = 0xffffffff;
+        [r->dummy replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&white bytesPerRow:4];
+        MTLTextureDescriptor *cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:1 mipmapped:NO];
+        r->dummy_cube = [dev newTextureWithDescriptor:cd];
+        for (NSUInteger f = 0; f < 6; f++) [r->dummy_cube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:f withBytes:&white bytesPerRow:4 bytesPerImage:4];
+        MTLTextureDescriptor *vd = [MTLTextureDescriptor new]; vd.textureType = MTLTextureType3D; vd.pixelFormat = MTLPixelFormatBGRA8Unorm; vd.width = vd.height = vd.depth = 1;
+        r->dummy_3d = [dev newTextureWithDescriptor:vd]; [r->dummy_3d replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&white bytesPerRow:4 bytesPerImage:4];
+        /* vertex attributes a draw doesn't supply: (0, 0, 0, 1), except colour 0 white and colour 1 black (as D3D) */
+        float def[16][4]; for (int k = 0; k < 16; k++) { def[k][0] = def[k][1] = def[k][2] = 0; def[k][3] = 1; }
+        def[2][0] = def[2][1] = def[2][2] = 1; def[3][3] = 0;
+        r->attr_defaults = [dev newBufferWithBytes:def length:sizeof def options:MTLResourceStorageModeShared]; }
+    return r;
+}
+
+// ---------- command buffer / encoder ----------
+static id<MTLCommandBuffer> cmdbuf(DSRRenderer *r) { if (!r->cb) { r->cb = [r->q commandBuffer]; r->encoders = 0; r->cb_bytes = 0; } return r->cb; }
+static Surf *surf(DSRRenderer *r, uint32_t id);
+static void end_enc(DSRRenderer *r)
+{
+    if (r->enc) {
+        if (r->enc_ms && r->enc_tile) {   /* resolved into tex_alt (the store action): now the picture */
+            Surf *c = surf(r, r->enc_cid);
+            if (c && c->ms == r->enc_ms) { id<MTLTexture> t = c->tex; c->tex = c->tex_alt; c->tex_alt = t; c->ms_dirty = 0; }
+        } else if (r->enc_ms) {   /* the samples resolved into tex as the pass ends; kept unless the next frame clears them */
+            Surf *c = surf(r, r->enc_cid); if (c && c->ms != r->enc_ms) c = NULL;
+            int drop = c && r->ending_frame && c->ok[0] >= 3 && !c->never[0];
+            [r->enc setColorStoreAction:drop ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve atIndex:0];
+            if (c) { c->ms_dirty = 0; c->dropped[0] = drop; }
+        }
+        if (r->enc_zu) { [r->enc setDepthStoreAction:MTLStoreActionStore]; [r->enc setStencilStoreAction:MTLStoreActionStore]; }
+        [r->enc endEncoding]; r->enc = nil; r->enc_ms = nil; r->enc_cid = r->enc_zid = 0; r->enc_zu = r->enc_tile = 0;
+    }
+    if (r->blit) { [r->blit endEncoding]; r->blit = nil; }
+}
+/* DSR_PROFILE=1: each pass in a command buffer of its own, its GPU time added up by kind and printed every 240 frames
+   (the passes no longer overlap on the GPU, so the total is a little more than without) */
+static int dsr_prof = -1; static const char *prof_label;
+static double prof_ms[24]; static long prof_n[24]; static const char *prof_names[24]; static pthread_mutex_t prof_mu = PTHREAD_MUTEX_INITIALIZER;
+static void commit(DSRRenderer *r);
+static void prof_cut(DSRRenderer *r, const char *label)   /* just before an encoder is made */
+{
+    if (dsr_prof < 0) dsr_prof = getenv("DSR_PROFILE") && atoi(getenv("DSR_PROFILE")) > 0;
+    if (!dsr_prof) return;
+    if (r->cb && r->encoders) commit(r);
+    prof_label = label;
+}
+static void prof_print(void)
+{
+    static int last; if (dsr_prof <= 0 || dsr_frame - last < 240) return;
+    int frames = dsr_frame - last; last = dsr_frame; double total = 0;
+    pthread_mutex_lock(&prof_mu);
+    for (int k = 0; k < 24 && prof_names[k]; k++) total += prof_ms[k];
+    extern long prof_waits_now(void);
+    fprintf(stderr, "dsr profile: %.2f ms a frame on the GPU; %.2f waits for the GPU a frame\n", total / frames, prof_waits_now() / (double)frames);
+    for (int k = 0; k < 24 && prof_names[k]; k++) {
+        fprintf(stderr, "dsr profile:   %-12s %6.2f ms  %5.1f passes\n", prof_names[k], prof_ms[k] / frames, prof_n[k] / (double)frames);
+        prof_ms[k] = 0; prof_n[k] = 0;
+    }
+    pthread_mutex_unlock(&prof_mu);
+}
+long prof_waits_now(void);
+static void commit(DSRRenderer *r)
+{
+    end_enc(r);
+    if (r->cb && dsr_prof > 0 && prof_label) {
+        const char *l = prof_label;
+        [r->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            double ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+            pthread_mutex_lock(&prof_mu);
+            int k = 0; while (k < 23 && prof_names[k] && prof_names[k] != l) k++;
+            prof_names[k] = l; prof_ms[k] += ms; prof_n[k]++;
+            pthread_mutex_unlock(&prof_mu); }];
+    }
+    if (r->cb) {
+        if (dsr_verbose) [r->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) { if (cb.error) fprintf(stderr, "command buffer error: %s\n", cb.error.localizedDescription.UTF8String); }];
+        int f = dsr_frame; [r->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) { if (f < 100000) dsr_gpu_ms[f] += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0; }];
+        [r->cb commit]; r->last_cb = r->cb; r->cb = nil;
+    }
+}
+// Long resource-only stretches (level loading) would otherwise pile thousands of encoders into one command buffer.
+static void maybe_commit(DSRRenderer *r) { if (r->cb && (r->encoders > 512 || r->cb_bytes > (64u << 20))) commit(r); }
+static void ring_grow(DSRRenderer *r, uint64_t need)
+{
+    if (need <= r->ring_size) return;
+    uint64_t size = MAX((uint64_t)r->ring_size * 2, (need + 255) & ~255ull);
+    if (size > UINT32_MAX) { fprintf(stderr, "dsr: upload ring request too large: %llu\n", (unsigned long long)need); exit(1); }
+    commit(r); if (r->last_cb) [r->last_cb waitUntilCompleted];
+    id<MTLBuffer> buffer = [r->dev newBufferWithLength:(NSUInteger)size options:MTLResourceStorageModeShared];
+    if (!buffer) { fprintf(stderr, "dsr: cannot grow upload ring to %llu bytes\n", (unsigned long long)size); exit(1); }
+    r->ring = buffer; r->ring_size = (uint32_t)size; r->ring_off = 0;
+}
+static long ring_wraps; static uint64_t ring_bytes;   /* DSR_RINGLOG: the upload ring's use, every 240 frames */
+static void ring_log(void)
+{
+    static int on = -1, last; if (on < 0) on = getenv("DSR_RINGLOG") != 0;
+    if (!on || dsr_frame - last < 240) return;
+    fprintf(stderr, "dsr ring: %.2f MB and %.3f waits a frame\n", ring_bytes / 1048576.0 / (dsr_frame - last), ring_wraps / (double)(dsr_frame - last));
+    ring_bytes = 0; ring_wraps = 0; last = dsr_frame;
+}
+static void *ring_alloc(DSRRenderer *r, uint32_t n, uint32_t *off)
+{
+    ring_grow(r, ((uint64_t)n + 255) & ~255ull);
+    n = (n + 255) & ~255u;
+    if ((uint64_t)r->ring_off + n > r->ring_size) {   // wrap: make sure the GPU is done with the old contents
+        commit(r); if (r->last_cb) [r->last_cb waitUntilCompleted]; ring_wraps++;
+        r->ring_off = 0;
+    }
+    ring_bytes += n;
+    *off = r->ring_off; r->ring_off += n; r->cb_bytes += n; return (uint8_t *)r->ring.contents + *off;
+}
+/* Reserve every allocation before binding draw state. A mid-draw wrap ends the encoder, and the replacement
+ * has no pipeline or vertex bindings. Include vertices, indices, constants and generated fan indices. */
+static void ring_room(DSRRenderer *r, uint64_t n)
+{
+    n += 6 * 256;                                   /* each allocation rounds up to 256 */
+    ring_grow(r, n);
+    if ((uint64_t)r->ring_off + n > r->ring_size) { commit(r); if (r->last_cb) [r->last_cb waitUntilCompleted]; r->ring_off = 0; ring_wraps++; }
+}
+static id<MTLBlitCommandEncoder> blit_enc(DSRRenderer *r)
+{
+    if (r->enc) end_enc(r);                            /* the pass's store actions are set as it ends */
+    if (!r->blit) { prof_cut(r, "blit"); r->blit = [cmdbuf(r) blitCommandEncoder]; r->encoders++; }
+    return r->blit;
+}
+static Surf *surf(DSRRenderer *r, uint32_t id) { return (id && id < MAXSURF && r->s[id].used) ? &r->s[id] : NULL; }
+/* ---- multisampling (D3DMULTISAMPLE_TYPE on render targets and depth buffers: the games' antialiasing) ---- */
+int dsr_msaa_ok(int n)   /* the samples this GPU draws with (the Direct3D layer offers only these) */
+{
+    static id<MTLDevice> d; if (!d) d = MTLCreateSystemDefaultDevice();
+    return n <= 1 || (n <= 8 && [d supportsTextureSampleCount:(NSUInteger)n]);
+}
+static int samples_of(const Surf *s) { return s && s->ms ? (int)s->samples : 1; }
+static int rt_samples(DSRRenderer *r) { return samples_of(surf(r, r->rt)); }
+static int sidx(int n) { return n >= 8 ? 3 : n >= 4 ? 2 : n >= 2 ? 1 : 0; }
+static void helpers_for(DSRRenderer *r, int n)   /* the quad and depth-clear pipelines for targets of n samples */
+{
+    int k = sidx(n); if (r->hq[k]) return;
+    NSError *err = nil; MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.rasterSampleCount = (NSUInteger)n;
+    d.vertexFunction = [r->lib newFunctionWithName:@"vs_quad"]; d.fragmentFunction = [r->lib newFunctionWithName:@"fs_quad"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    r->hq[k] = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    d.colorAttachments[0].blendingEnabled = YES;
+    d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    r->hqo[k] = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    d.colorAttachments[0].blendingEnabled = NO;
+    d.vertexFunction = [r->lib newFunctionWithName:@"vs_zclear"]; d.fragmentFunction = nil;
+    d.colorAttachments[0].writeMask = MTLColorWriteMaskNone; d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    r->hz[k] = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!r->hq[k] || !r->hqo[k] || !r->hz[k]) { fprintf(stderr, "dsr: %d-sample helper pipelines: %s\n", n, err.localizedDescription.UTF8String); exit(1); }
+}
+static void end_enc(DSRRenderer *r);
+static id<MTLCommandBuffer> cmdbuf(DSRRenderer *r);
+static void resolve(DSRRenderer *r, Surf *s)   /* a multisampled surface's picture, before tex is read */
+{
+    if (!s || !s->ms || !s->ms_dirty) return;
+    end_enc(r);                                        /* its open pass resolves it as it ends */
+    if (s->ms_tile) { s->ms_dirty = 0; return; }       /* memoryless samples can't be loaded: only a pass of its own resolves them */
+    if (!s->ms_dirty) return;
+    prof_cut(r, "resolve");
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = s->ms; p.colorAttachments[0].resolveTexture = s->tex;
+    p.colorAttachments[0].resolveSlice = s->slice; p.colorAttachments[0].resolveLevel = s->level;
+    p.colorAttachments[0].loadAction = MTLLoadActionLoad; p.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+    [[cmdbuf(r) renderCommandEncoderWithDescriptor:p] endEncoding]; r->encoders++;
+    s->ms_dirty = 0;
+}
+static int ms_tile_ok(DSRRenderer *r)
+{
+    static int ok = -1; if (ok < 0) ok = !(getenv("DSR_MS_KEEP") && atoi(getenv("DSR_MS_KEEP"))) && [r->dev supportsFamily:MTLGPUFamilyApple7];
+    return ok;
+}
+static id<MTLTexture> ms_texture(DSRRenderer *r, MTLPixelFormat pf, uint32_t w, uint32_t h, int n, int memoryless)
+{
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+    d.textureType = MTLTextureType2DMultisample; d.sampleCount = (NSUInteger)n; d.usage = MTLTextureUsageRenderTarget;
+    d.storageMode = memoryless ? MTLStorageModeMemoryless : MTLStorageModePrivate;
+    return [r->dev newTextureWithDescriptor:d];
+}
+static id<MTLRenderCommandEncoder> enc_for(DSRRenderer *r, uint32_t rt, uint32_t ds)
+{
+    if (r->enc && r->enc_rt == rt && r->enc_ds == ds) return r->enc;
+    end_enc(r); maybe_commit(r);
+    Surf *c = surf(r, rt), *z = surf(r, ds); if (!c) return nil;
+    prof_cut(r, c->ms ? (z ? "pass ms+z" : "pass ms") : (z ? "pass +z" : "pass"));
+    { static int lf = -2; if (lf == -2) lf = getenv("DSR_PASSLOG") ? atoi(getenv("DSR_PASSLOG")) : -1;   /* development: one frame's passes */
+      if (lf >= 0 && dsr_frame == lf) fprintf(stderr, "dsr pass: rt %u %ux%u%s ds %u%s%s\n", rt, c->w, c->h, c->ms ? " ms" : "", z ? ds : 0,
+                                              (r->pend_flags & 1) ? " clear colour" : "", (r->pend_flags & 2) ? " clear depth" : ""); }
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    int cs = samples_of(c);
+    /* A pass that starts with a clear of the whole target (pend_flags, from clear()) clears as it loads: on Apple's GPUs a
+     * load or store of a Retina-sized multisampled target is the costliest part of a pass. */
+    uint32_t pf = r->pend_flags; r->pend_flags = 0;
+    if (pf & 1) {
+        uint32_t k = r->pend_color;
+        p.colorAttachments[0].loadAction = MTLLoadActionClear;
+        p.colorAttachments[0].clearColor = MTLClearColorMake(((k >> 16) & 255) / 255.0, ((k >> 8) & 255) / 255.0, (k & 255) / 255.0, ((k >> 24) & 255) / 255.0);
+    } else p.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    int restore = 0;
+    if (c->ms && c->ms_tile) {                         /* tile memory only (see Surf): resolved into tex_alt as the pass ends */
+        p.colorAttachments[0].texture = c->ms; p.colorAttachments[0].resolveTexture = c->tex_alt;
+        if (!(pf & 1)) { p.colorAttachments[0].loadAction = MTLLoadActionDontCare; restore = 1; }
+        p.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+        c->ms_dirty = 1; r->enc_ms = c->ms; r->enc_cid = rt; r->enc_tile = 1;
+    } else if (c->ms) {                                /* drawn into the samples, resolved into the texture as the pass ends (end_enc) */
+        p.colorAttachments[0].texture = c->ms; p.colorAttachments[0].resolveTexture = c->tex;
+        p.colorAttachments[0].resolveSlice = c->slice; p.colorAttachments[0].resolveLevel = c->level;
+        p.colorAttachments[0].storeAction = MTLStoreActionUnknown; c->ms_dirty = 1; r->enc_ms = c->ms; r->enc_cid = rt;
+        if (c->gen[0] != dsr_frame + 1) {             /* the frame's first pass into it */
+            c->gen[0] = dsr_frame + 1;
+            if (pf & 1) c->ok[0]++;
+            else { if (c->dropped[0] && !c->never[0]) { c->never[0] = 1; fprintf(stderr, "dsr: target %u is read in the next frame: kept\n", rt); } c->ok[0] = 0; }
+        }
+        c->dropped[0] = 0;
+    } else {
+        p.colorAttachments[0].texture = c->tex; p.colorAttachments[0].storeAction = MTLStoreActionStore;
+        p.colorAttachments[0].slice = c->slice; p.colorAttachments[0].level = c->level;
+    }
+    if (z) {
+        id<MTLTexture> zt = z->ms ? z->ms : z->tex;
+        if (samples_of(z) != cs) {                     /* a depth buffer of another sample count: the target's own (contents not shared) */
+            if (!c->auxz || c->auxz.width != c->w || c->auxz.height != c->h) {
+                if (cs > 1) c->auxz = ms_texture(r, MTLPixelFormatDepth32Float_Stencil8, c->w, c->h, cs, 0);
+                else { MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:c->w height:c->h mipmapped:NO];
+                       d.usage = MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModePrivate; c->auxz = [r->dev newTextureWithDescriptor:d]; }
+                static int n; if (n++ < 4) fprintf(stderr, "dsr: render target %u (%d samples) with depth %u (%d): a depth buffer of its own\n", rt, cs, ds, samples_of(z));
+            }
+            zt = c->auxz;
+        }
+        p.depthAttachment.texture = zt; p.depthAttachment.loadAction = (pf & 2) ? MTLLoadActionClear : MTLLoadActionLoad; p.depthAttachment.clearDepth = r->pend_z;
+        p.stencilAttachment.texture = zt; p.stencilAttachment.loadAction = (pf & 4) ? MTLLoadActionClear : MTLLoadActionLoad; p.stencilAttachment.clearStencil = r->pend_stencil & 255;
+        if (zt == c->auxz) { p.depthAttachment.storeAction = p.stencilAttachment.storeAction = MTLStoreActionStore; }
+        else { p.depthAttachment.storeAction = p.stencilAttachment.storeAction = MTLStoreActionUnknown; r->enc_zid = ds; r->enc_zu = 1; } }   /* stored as the pass ends (end_enc) */
+    if (cs > 1) helpers_for(r, cs);
+    r->enc = [cmdbuf(r) renderCommandEncoderWithDescriptor:p]; r->enc_rt = rt; r->enc_ds = z ? ds : 0; r->encoders++;
+    [r->enc setFrontFacingWinding:MTLWindingClockwise];   // same convention as D3D
+    if (restore) {                                     /* the picture so far into the samples */
+        int k = sidx(cs), hd = z != 0;
+        if (!r->hqr[k][hd]) {
+            MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
+            d.rasterSampleCount = (NSUInteger)cs; d.vertexFunction = [r->lib newFunctionWithName:@"vs_quad"]; d.fragmentFunction = [r->lib newFunctionWithName:@"fs_quad"];
+            d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            if (hd) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+            r->hqr[k][hd] = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+            if (!r->hqr[k][hd]) { fprintf(stderr, "dsr: restore pipeline: %s\n", err.localizedDescription.UTF8String); exit(1); }
+        }
+        struct { float dst[4], src[4], color[4]; int32_t mode[4]; } q = {{0, 0, 1, 1}, {0, 0, 1, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+        [r->enc setRenderPipelineState:r->hqr[k][hd]]; [r->enc setDepthStencilState:r->nodepth_ds]; [r->enc setCullMode:MTLCullModeNone];
+        [r->enc setViewport:(MTLViewport){0, 0, c->w, c->h, 0, 1}];
+        [r->enc setVertexBytes:&q length:sizeof q atIndex:0]; [r->enc setFragmentBytes:&q length:sizeof q atIndex:0];
+        [r->enc setFragmentTexture:c->tex atIndex:0]; [r->enc setFragmentSamplerState:r->point_clamp atIndex:0];
+        [r->enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+    memset(&r->es, 0, sizeof r->es); r->es.cull = -1;
+    return r->enc;
+}
+
+// ---------- surfaces ----------
+static void surface_create(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    uint32_t id = p[0], w = p[1], h = p[2], kind = p[3], fmt = p[4], parent = p[5], level = p[6];
+    uint32_t face = size >= 40 ? p[8] : 0, cube = size >= 40 && (p[9] & 1);
+    if (id >= MAXSURF) return;
+    Surf *s = &r->s[id]; s->tex = s->view2d = s->ms = s->auxz = s->tex_alt = nil; s->samples = 0; s->ms_tile = 0; s->ms_dirty = 0; s->used = 1; s->fxrt = 0; s->w = w; s->h = h; s->kind = kind; s->fmt = fmt; s->level = level; s->root = id; s->slice = face;
+    memset(s->gen, 0, sizeof s->gen); memset(s->ok, 0, sizeof s->ok); memset(s->dropped, 0, sizeof s->dropped); memset(s->never, 0, sizeof s->never);
+    if (parent && surf(r, parent)) {                       // a mip level (or another cube face): shares the root's texture
+        Surf *root = surf(r, parent); s->tex = root->tex; s->root = parent;
+        if (cube && level == 0)                            // a cube face: its own 2D view
+            s->view2d = [s->tex newTextureViewWithPixelFormat:s->tex.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, s->tex.mipmapLevelCount) slices:NSMakeRange(face, 1)];
+        else s->view2d = root->view2d;
+        return;
+    }
+    if (kind == 3 && parent == 0 && cube) {
+        uint32_t levels = p[7] ? p[7] : 1;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:w mipmapped:levels > 1];
+        d.mipmapLevelCount = levels; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView; d.storageMode = MTLStorageModePrivate;
+        s->tex = [r->dev newTextureWithDescriptor:d];
+        s->view2d = [s->tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm textureType:MTLTextureType2D levels:NSMakeRange(0, levels) slices:NSMakeRange(0, 1)];
+    } else if (kind == 3 && parent == 0) {
+        uint32_t levels = size >= 32 && p[7] ? p[7] : 1;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:levels > 1];
+        d.mipmapLevelCount = levels; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModePrivate;   // XRGB: alpha forced to 1 in the shader (swizzles can't be render targets)
+        s->tex = [r->dev newTextureWithDescriptor:d];
+    } else {
+        MTLPixelFormat pf = fmt == 3 ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatBGRA8Unorm;   // depth buffers carry an 8-bit stencil
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModePrivate;   // XRGB targets: alpha is never read back as destination alpha
+        s->tex = [r->dev newTextureWithDescriptor:d];
+        int n = size >= 40 ? (int)((p[9] >> 8) & 0xff) : 0;   /* multisampled: the most this GPU has, up to the asked */
+        while (n > 1 && !dsr_msaa_ok(n)) n--;
+        if (n > 1) {
+            s->ms_tile = fmt != 3 && ms_tile_ok(r);
+            s->ms = ms_texture(r, pf, w, h, n, s->ms_tile); s->samples = (uint32_t)n;
+            if (s->ms_tile) s->tex_alt = [r->dev newTextureWithDescriptor:d];
+        }
+        if (fmt != 3) {   /* a new target starts black, not with whatever the memory held (it showed as a pink border
+                             beside the first loading screens, before anything was drawn there) */
+            end_enc(r); prof_cut(r, "new target");
+            MTLRenderPassDescriptor *cp = [MTLRenderPassDescriptor renderPassDescriptor];
+            cp.colorAttachments[0].texture = s->ms ? s->ms : s->tex; cp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            cp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); cp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            if (s->ms) { cp.colorAttachments[0].resolveTexture = s->tex; cp.colorAttachments[0].storeAction = s->ms_tile ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve; }
+            [[cmdbuf(r) renderCommandEncoderWithDescriptor:cp] endEncoding]; r->encoders++;
+        }
+    }
+}
+static void surface_upload(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    Surf *s = surf(r, p[0]); if (!s || s->fmt == 3) return;
+    uint32_t x = p[1], y = p[2], w = p[3], h = p[4], pitch = p[5], off;
+    if (!w || !h || 24 + (uint64_t)pitch * h > size) return;                     /* 64-bit: no wrap */
+    if (s->level >= s->tex.mipmapLevelCount || (uint64_t)x + w > (s->tex.width >> s->level ?: 1) || (uint64_t)y + h > (s->tex.height >> s->level ?: 1)) return;
+    if (!r->enc) maybe_commit(r);
+    void *dst = ring_alloc(r, pitch * h, &off); memcpy(dst, p + 6, pitch * h);
+    [blit_enc(r) copyFromBuffer:r->ring sourceOffset:off sourceBytesPerRow:pitch sourceBytesPerImage:pitch * h sourceSize:MTLSizeMake(w, h, 1)
+            toTexture:s->tex destinationSlice:s->slice destinationLevel:s->level destinationOrigin:MTLOriginMake(x, y, 0)];
+}
+
+// DSR_DEPTH_UPLOAD: a depth buffer the game wrote with the CPU (Delta Force 2 draws its terrain in software, depth
+// included, then its Direct3D polygons against it). The values go through the ring into a float texture, then a
+// full-screen pass writes them as depth.
+static void depth_upload(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    Surf *z = surf(r, p[0]), *rt = surf(r, r->rt); uint32_t w = p[1], h = p[2], off;
+    if (!z || z->fmt != 3 || !rt || !w || !h || w != z->w || h != z->h || rt->w != w || rt->h != h || 12 + 4ull * w * h > size) return;
+    if (!r->zup_tex || r->zup_tex.width != w || r->zup_tex.height != h) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:w height:h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate; r->zup_tex = [r->dev newTextureWithDescriptor:d];
+    }
+    if (!r->enc) maybe_commit(r);
+    void *dst = ring_alloc(r, w * h * 4, &off); memcpy(dst, p + 3, (size_t)w * h * 4);
+    [blit_enc(r) copyFromBuffer:r->ring sourceOffset:off sourceBytesPerRow:w * 4 sourceBytesPerImage:w * h * 4 sourceSize:MTLSizeMake(w, h, 1)
+            toTexture:r->zup_tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, p[0]);
+    [e setRenderPipelineState:r->zupload_pso]; [e setDepthStencilState:r->zclear_ds]; [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, w, h, 0, 1}]; [e setFragmentTexture:r->zup_tex atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    memset(&r->es, 0, sizeof r->es); r->es.cull = -1;
+}
+
+// ---------- quads (blits, fills) ----------
+static void quad(DSRRenderer *r, uint32_t dst, const int32_t *drect, uint32_t src, const int32_t *srect, int fill, uint32_t color);
+// The game composited its cursor over zeros (see surface.c): the pixels are premultiplied, alpha = coverage.
+static void upload_over(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    Surf *s = surf(r, p[0]); uint32_t x = p[1], y = p[2], w = p[3], h = p[4], pitch = p[5], off;
+    if (!s || !w || !h || 24 + (uint64_t)pitch * h > size) return;
+    if (w > 256 || h > 256) { surface_upload(r, p, size); return; }
+    if ((uint64_t)x + w > s->w || (uint64_t)y + h > s->h) return;
+    if (!r->enc) maybe_commit(r);
+    void *dst = ring_alloc(r, pitch * h, &off); memcpy(dst, p + 6, pitch * h);
+    [blit_enc(r) copyFromBuffer:r->ring sourceOffset:off sourceBytesPerRow:pitch sourceBytesPerImage:pitch * h sourceSize:MTLSizeMake(w, h, 1)
+            toTexture:r->scratch destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    int32_t dr[4] = {(int32_t)x, (int32_t)y, (int32_t)(x + w), (int32_t)(y + h)}, sr[4] = {0, 0, (int32_t)w, (int32_t)h};
+    quad(r, p[0], dr, 0, sr, 2, 0);
+}
+static void quad(DSRRenderer *r, uint32_t dst, const int32_t *drect, uint32_t src, const int32_t *srect, int fill, uint32_t color)
+{
+    Surf *d = surf(r, dst), *s = surf(r, src); if (!d || d->fmt == 3 || !(d->tex.usage & MTLTextureUsageRenderTarget)) return;
+    if (s && s != d) resolve(r, s);
+    if (!fill && s && s != d && !d->ms && s->fmt != 3 && s->tex.pixelFormat == d->tex.pixelFormat && s->tex.sampleCount == 1 &&
+        drect[2] - drect[0] == srect[2] - srect[0] && drect[3] - drect[1] == srect[3] - srect[1] && drect[2] > drect[0] && drect[3] > drect[1] &&
+        drect[0] >= 0 && drect[1] >= 0 && srect[0] >= 0 && srect[1] >= 0 && (uint32_t)drect[2] <= d->w && (uint32_t)drect[3] <= d->h &&
+        (uint32_t)srect[2] <= s->w && (uint32_t)srect[3] <= s->h) {   /* a copy at the same size: the rectangle alone, not a pass over the target */
+        [blit_enc(r) copyFromTexture:s->tex sourceSlice:s->slice sourceLevel:s->level sourceOrigin:MTLOriginMake((NSUInteger)srect[0], (NSUInteger)srect[1], 0)
+                          sourceSize:MTLSizeMake((NSUInteger)(srect[2] - srect[0]), (NSUInteger)(srect[3] - srect[1]), 1)
+                           toTexture:d->tex destinationSlice:d->slice destinationLevel:d->level destinationOrigin:MTLOriginMake((NSUInteger)drect[0], (NSUInteger)drect[1], 0)];
+        return;
+    }
+    struct { float dst[4], src[4], color[4]; int32_t mode[4]; } q;
+    q.dst[0] = drect[0] / (float)d->w; q.dst[1] = drect[1] / (float)d->h; q.dst[2] = drect[2] / (float)d->w; q.dst[3] = drect[3] / (float)d->h;
+    if (fill == 2) { q.src[0] = srect[0] / 256.0f; q.src[1] = srect[1] / 256.0f; q.src[2] = srect[2] / 256.0f; q.src[3] = srect[3] / 256.0f; }
+    else if (s) { float sw = s->w, sh = s->h; q.src[0] = srect[0] / sw; q.src[1] = srect[1] / sh; q.src[2] = srect[2] / sw; q.src[3] = srect[3] / sh; }
+    q.color[0] = ((color >> 16) & 255) / 255.0f; q.color[1] = ((color >> 8) & 255) / 255.0f; q.color[2] = (color & 255) / 255.0f; q.color[3] = ((color >> 24) & 255) / 255.0f;
+    q.mode[0] = fill == 1;
+    id<MTLRenderCommandEncoder> e = enc_for(r, dst, 0); if (!e) return;
+    int k = sidx(samples_of(d)); [e setRenderPipelineState:fill == 2 ? r->hqo[k] : r->hq[k]]; [e setDepthStencilState:r->nodepth_ds]; [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, d->w, d->h, 0, 1}];
+    [e setVertexBytes:&q length:sizeof q atIndex:0]; [e setFragmentBytes:&q length:sizeof q atIndex:0];
+    [e setFragmentTexture:fill == 2 ? r->scratch : s ? tex2d(s) : r->dummy atIndex:0]; [e setFragmentSamplerState:r->point_clamp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    memset(&r->es, 0, sizeof r->es); r->es.cull = -1;   // the draw-state cache no longer matches the encoder
+}
+
+// ---------- the PS2's radiosity (DSR_GLOW) ----------
+static id<MTLRenderPipelineState> glow_pso(DSRRenderer *r, NSString *fs, int samples, int add)
+{
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
+    d.vertexFunction = [r->lib newFunctionWithName:@"vs_present"]; d.fragmentFunction = [r->lib newFunctionWithName:fs];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm; d.rasterSampleCount = (NSUInteger)samples;
+    if (add) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+               d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero; d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne; }
+    id<MTLRenderPipelineState> p = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!p) fprintf(stderr, "dsr: glow pipeline %s: %s\n", fs.UTF8String, err.localizedDescription.UTF8String);
+    return p;
+}
+static void glow_pass(DSRRenderer *r, id<MTLTexture> dst, id<MTLRenderPipelineState> pso, id<MTLTexture> src, const float g[4])
+{
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = dst; p.colorAttachments[0].loadAction = MTLLoadActionDontCare; p.colorAttachments[0].storeAction = MTLStoreActionStore;
+    prof_cut(r, "glow"); id<MTLRenderCommandEncoder> e = [cmdbuf(r) renderCommandEncoderWithDescriptor:p]; r->encoders++;
+    [e setRenderPipelineState:pso]; [e setFragmentTexture:src atIndex:0]; [e setFragmentSamplerState:r->linear_clamp atIndex:0];
+    [e setFragmentBytes:g length:16 atIndex:0]; [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [e endEncoding];
+}
+static void glow(DSRRenderer *r, uint32_t limit, uint32_t strength)
+{
+    Surf *c = surf(r, r->rt); if (!c || c->fmt == 3 || c->kind == 3 || !strength) return;
+    resolve(r, c); end_enc(r); maybe_commit(r);
+    uint32_t w = c->w / 4 > 0 ? c->w / 4 : 1, h = c->h / 4 > 0 ? c->h / 4 : 1;
+    if (!r->glow_t[0] || r->glow_t[0].width != w || r->glow_t[0].height != h)
+        for (int k = 0; k < 2; k++) {
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate; r->glow_t[k] = [r->dev newTextureWithDescriptor:d];
+        }
+    if (!r->glow_x) { r->glow_x = glow_pso(r, @"fs_glow_extract", 1, 0); r->glow_b = glow_pso(r, @"fs_glow_blur", 1, 0); }
+    int ns = samples_of(c), k = sidx(ns);
+    if (!r->glow_add[k]) r->glow_add[k] = glow_pso(r, @"fs_glow_add", ns, 1);
+    if (!r->glow_x || !r->glow_b || !r->glow_add[k]) return;
+    float gx[4] = {limit / 255.0f, 0, 1.0f / c->w, 1.0f / c->h}; glow_pass(r, r->glow_t[0], r->glow_x, c->tex, gx);
+    float gh[4] = {1.0f / w, 0, 0, 0}; glow_pass(r, r->glow_t[1], r->glow_b, r->glow_t[0], gh);
+    float gv[4] = {0, 1.0f / h, 0, 0}; glow_pass(r, r->glow_t[0], r->glow_b, r->glow_t[1], gv);
+    id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, 0); if (!e) return;   /* added over the frame */
+    float ga[4] = {0, strength / 255.0f * 2.0f, 0, 0};
+    [e setRenderPipelineState:r->glow_add[k]]; [e setDepthStencilState:r->nodepth_ds]; [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, c->w, c->h, 0, 1}];
+    [e setFragmentTexture:r->glow_t[0] atIndex:0]; [e setFragmentSamplerState:r->linear_clamp atIndex:0]; [e setFragmentBytes:ga length:16 atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    memset(&r->es, 0, sizeof r->es); r->es.cull = -1;
+}
+
+// ---------- fixed-function draws ----------
+static MTLBlendFactor bf(uint32_t b)
+{
+    switch (b) { case 1: return MTLBlendFactorZero; case 2: return MTLBlendFactorOne; case 3: return MTLBlendFactorSourceColor; case 4: return MTLBlendFactorOneMinusSourceColor;
+    case 5: return MTLBlendFactorSourceAlpha; case 6: return MTLBlendFactorOneMinusSourceAlpha; case 7: return MTLBlendFactorDestinationAlpha; case 8: return MTLBlendFactorOneMinusDestinationAlpha;
+    case 9: return MTLBlendFactorDestinationColor; case 10: return MTLBlendFactorOneMinusDestinationColor; case 11: return MTLBlendFactorSourceAlphaSaturated; default: return MTLBlendFactorOne; }
+}
+static MTLCompareFunction cmpf(uint32_t f)
+{
+    switch (f) { case 1: return MTLCompareFunctionNever; case 2: return MTLCompareFunctionLess; case 3: return MTLCompareFunctionEqual; case 4: return MTLCompareFunctionLessEqual;
+    case 5: return MTLCompareFunctionGreater; case 6: return MTLCompareFunctionNotEqual; case 7: return MTLCompareFunctionGreaterEqual; default: return MTLCompareFunctionAlways; }
+}
+/* a target without alpha (XRGB, the back buffer too): D3D reads its destination alpha as 1 */
+static uint32_t target_bf(DSRRenderer *r, uint32_t b)
+{
+    Surf *t = surf(r, r->rt); if (!t || t->fmt != 2) return b;
+    return b == 7 ? 2 : b == 8 ? 1 : b;                     /* DESTALPHA -> ONE, INVDESTALPHA -> ZERO */
+}
+/* D3DRS_BLENDOP (171): 1 add (the default), 2 subtract, 3 reverse subtract, 4 min, 5 max (San Andreas' radiosity
+ * subtracts the time cycle's limit from the bright parts of the frame) */
+static uint32_t blendop(DSRRenderer *r) { uint32_t o = r->rs[171]; return o >= 1 && o <= 5 ? o : 1; }
+static MTLBlendOperation bop(DSRRenderer *r)
+{
+    switch (blendop(r)) { case 2: return MTLBlendOperationSubtract; case 3: return MTLBlendOperationReverseSubtract;
+                          case 4: return MTLBlendOperationMin; case 5: return MTLBlendOperationMax; default: return MTLBlendOperationAdd; }
+}
+/* fs_main specialised by the texture stages' state, as Metal function constants 1-5: each pipeline runs only what its
+ * stages do. The general shader's per-pixel switches over the stages' operations and arguments held Retina sizes far
+ * under 120 fps (Vice City at 4112x2658: 71 fps without antialiasing; with a trivial shader, 120). mprog: the Direct3D 9
+ * shader path, whose uniforms have no specular add or generated coordinates. */
+typedef struct { int32_t c0, a0, c1, a1, fl; } FsKey;
+static FsKey fs_key(DSRRenderer *r, int mprog)
+{
+    FsKey k; Surf *t0 = surf(r, r->tex[0]), *t1 = surf(r, r->tex[1]);
+    k.c0 = (int32_t)((r->tss[0][1] & 255) | (r->tss[0][2] & 255) << 8 | (r->tss[0][3] & 255) << 16);   /* colour: op, arg1, arg2 */
+    k.a0 = (int32_t)((r->tss[0][4] & 255) | (r->tss[0][5] & 255) << 8 | (r->tss[0][6] & 255) << 16);   /* alpha */
+    k.c1 = (int32_t)((r->tss[1][1] & 255) | (r->tss[1][2] & 255) << 8 | (r->tss[1][3] & 255) << 16);
+    k.a1 = (int32_t)((r->tss[1][4] & 255) | (r->tss[1][5] & 255) << 8 | (r->tss[1][6] & 255) << 16);
+    k.fl = (t0 != NULL) | (t1 != NULL) << 1 | (t0 && t0->fmt == 2) << 2 | (t1 && t1->fmt == 2) << 3;
+    if (!mprog) {
+        k.fl |= (r->rs[29] != 0) << 4;                                                       /* D3DRS_SPECULARENABLE */
+        if ((r->tss[0][11] & 0xffff0000u) == 0x20000u) k.fl |= 1 << 5;                       /* TCI_CAMERASPACEPOSITION */
+        if (r->tss[0][24] & 0x100) k.fl |= 1 << 6;                                           /* D3DTTFF_PROJECTED */
+    }
+    if (r->rs[15]) k.fl |= 1 << 12 | (int32_t)(r->rs[25] & 15) << 8;                          /* alpha test, its function */
+    return k;
+}
+static uint64_t fs_hash(FsKey k)
+{
+    uint64_t a = (uint64_t)(uint32_t)k.c0 << 32 | (uint32_t)k.a0, b = (uint64_t)(uint32_t)k.c1 << 32 | (uint32_t)k.a1, h = a * 0x9e3779b97f4a7c15ull;
+    h ^= h >> 29; h += b * 0xbf58476d1ce4e5b9ull; h ^= h >> 31; h += (uint64_t)(uint32_t)k.fl * 0x94d049bb133111ebull; h ^= h >> 32;
+    return h;
+}
+static id<MTLFunction> fs_main_for(DSRRenderer *r, int atest, FsKey k)
+{
+    uint64_t key = fs_hash(k) ^ (uint64_t)(atest != 0) * 0xd6e8feb86659fd93ull; if (!key) key = 1;
+    uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 54);
+    while (r->fsf_k[h] && r->fsf_k[h] != key) h = (h + 1) & 1023;
+    if (r->fsf_k[h]) return r->fsf_v[h];
+    MTLFunctionConstantValues *fc = [MTLFunctionConstantValues new]; bool at = atest != 0; NSError *err = nil;
+    [fc setConstantValue:&at type:MTLDataTypeBool atIndex:0];
+    [fc setConstantValue:&k.c0 type:MTLDataTypeInt atIndex:1]; [fc setConstantValue:&k.a0 type:MTLDataTypeInt atIndex:2];
+    [fc setConstantValue:&k.c1 type:MTLDataTypeInt atIndex:3]; [fc setConstantValue:&k.a1 type:MTLDataTypeInt atIndex:4];
+    [fc setConstantValue:&k.fl type:MTLDataTypeInt atIndex:5];
+    id<MTLFunction> f = [r->lib newFunctionWithName:@"fs_main" constantValues:fc error:&err];
+    if (!f) { fprintf(stderr, "dsr: fs_main: %s\n", err.localizedDescription.UTF8String); return nil; }
+    if (r->fsf_n >= 768) { static int w; if (!w++) fprintf(stderr, "dsr: fs_main cache full (768): new variants are no longer kept\n"); }
+    if (r->fsf_n < 768) { r->fsf_k[h] = key; r->fsf_v[h] = f; r->fsf_n++; }
+    return f;
+}
+static id<MTLRenderPipelineState> pipeline_for(DSRRenderer *r, uint32_t fvf, int has_depth)
+{
+    uint32_t blend = r->rs[27] ? 1 : 0, sb = blend ? target_bf(r, r->rs[19]) : 2, db = blend ? target_bf(r, r->rs[20]) : 1;
+    uint32_t atest = r->rs[15] ? 1 : 0;                                                       // D3DRS_ALPHATESTENABLE
+    uint32_t cw = r->rs[168] & 15;                                                            // D3DRS_COLORWRITEENABLE (R1 G2 B4 A8)
+    uint64_t key = ((uint64_t)fvf << 32) | (uint64_t)cw << 20 | (blend << 16) | (sb << 8) | (db << 4) | atest << 2 | (uint64_t)has_depth << 1 | 1;   // never 0
+    if (blend) key |= (uint64_t)(blendop(r) - 1) << 24;
+    int nsm = rt_samples(r); if (nsm > 1) key ^= (uint64_t)nsm * 0x9e3779b97f4a7c15ull;                             // multisampled targets: their own
+    FsKey fk = fs_key(r, 0); key ^= fs_hash(fk); if (!key) key = 1;                                             // the texture stages (fs_main_for)
+    if (key == r->pso_k[r->pso_last]) return r->pso_v[r->pso_last];                                         // same as the last draw
+    uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 52);
+    while (r->pso_k[h] && r->pso_k[h] != key) h = (h + 1) & 4095;
+    if (r->pso_k[h]) { r->pso_last = h; return r->pso_v[h]; }
+    id<MTLRenderPipelineState> p;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
+    d.vertexFunction = [r->lib newFunctionWithName:@"vs_main"]; d.rasterSampleCount = (NSUInteger)nsm;
+    {   d.fragmentFunction = fs_main_for(r, (int)atest, fk);
+    }
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (has_depth) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    d.colorAttachments[0].writeMask = (cw & 1 ? MTLColorWriteMaskRed : 0) | (cw & 2 ? MTLColorWriteMaskGreen : 0) | (cw & 4 ? MTLColorWriteMaskBlue : 0) | (cw & 8 ? MTLColorWriteMaskAlpha : 0);
+    if (blend) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = bf(sb);
+                 d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor = bf(db);
+                 d.colorAttachments[0].rgbBlendOperation = d.colorAttachments[0].alphaBlendOperation = bop(r); }
+    MTLVertexDescriptor *v = [MTLVertexDescriptor vertexDescriptor]; uint32_t off = 0;
+    int rhw = (fvf & 0xe) == 4;
+    v.attributes[0].format = rhw ? MTLVertexFormatFloat4 : MTLVertexFormatFloat3; v.attributes[0].offset = 0; v.attributes[0].bufferIndex = 0; off = rhw ? 16 : 12;
+    /* what the vertex lacks comes from constant buffers: 2 white (colours), 3 attr_defaults (zeros: normal, coordinates) */
+    v.attributes[3].format = MTLVertexFormatFloat3;
+    if (fvf & 0x10) { v.attributes[3].offset = off; v.attributes[3].bufferIndex = 0; off += 12; }      // normal (lighting, texgen)
+    else { v.attributes[3].offset = 0; v.attributes[3].bufferIndex = 3; }
+    if (fvf & 0x40) { v.attributes[1].format = MTLVertexFormatUChar4Normalized_BGRA; v.attributes[1].offset = off; v.attributes[1].bufferIndex = 0; off += 4; }
+    else { v.attributes[1].format = MTLVertexFormatUChar4Normalized_BGRA; v.attributes[1].offset = 0; v.attributes[1].bufferIndex = 2; }
+    v.attributes[4].format = MTLVertexFormatUChar4Normalized_BGRA;                          // specular (colour 2: a material source)
+    if (fvf & 0x80) { v.attributes[4].offset = off; v.attributes[4].bufferIndex = 0; off += 4; }
+    else { v.attributes[4].offset = 0; v.attributes[4].bufferIndex = 2; }
+    uint32_t ntc = (fvf >> 8) & 0xf, tsz[8]; for (uint32_t k = 0; k < 8; k++) { uint32_t f = (fvf >> (16 + 2 * k)) & 3; tsz[k] = f == 0 ? 8 : f == 1 ? 12 : f == 2 ? 16 : 4; }
+    if (ntc) { v.attributes[2].format = MTLVertexFormatFloat2; v.attributes[2].offset = off; v.attributes[2].bufferIndex = 0; }
+    else { v.attributes[2].format = MTLVertexFormatFloat2; v.attributes[2].offset = 0; v.attributes[2].bufferIndex = 2; }
+    v.attributes[5].format = MTLVertexFormatFloat2;                                           // coordinate set 1
+    if (ntc >= 2) { v.attributes[5].offset = off + tsz[0]; v.attributes[5].bufferIndex = 0; }
+    else { v.attributes[5].offset = 0; v.attributes[5].bufferIndex = 3; }
+    uint32_t stride = off; for (uint32_t k = 0; k < ntc; k++) stride += tsz[k];
+    v.layouts[0].stride = stride;
+    /* the constant buffers only when an attribute reads one: Metal refuses a layout no attribute uses (a vertex with a
+     * normal and two coordinate sets needs no buffer 3: San Andreas) */
+    int use2 = 0, use3 = 0; for (int a = 1; a <= 5; a++) { use2 |= v.attributes[a].bufferIndex == 2; use3 |= v.attributes[a].bufferIndex == 3; }
+    if (use2) { v.layouts[2].stride = 16; v.layouts[2].stepFunction = MTLVertexStepFunctionConstant; v.layouts[2].stepRate = 0; }
+    if (use3) { v.layouts[3].stride = 16; v.layouts[3].stepFunction = MTLVertexStepFunctionConstant; v.layouts[3].stepRate = 0; }
+    d.vertexDescriptor = v;
+    double t0 = CACurrentMediaTime();
+    p = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!p) { fprintf(stderr, "pipeline fvf %x: %s\n", fvf, err.localizedDescription.UTF8String); return nil; }
+    static int psolog = -1; if (psolog < 0) psolog = getenv("DSR_PSOLOG") != 0;
+    if (psolog) fprintf(stderr, "dsr: new pipeline %#llx in %.1f ms (frame %d)\n", (unsigned long long)key, (CACurrentMediaTime() - t0) * 1000, dsr_frame);
+    if (r->pso_n >= 3072) { static int w; if (!w++) fprintf(stderr, "dsr: pipeline cache full (3072): new pipelines are no longer kept\n"); }
+    if (r->pso_n < 3072) { r->pso_k[h] = key; r->pso_v[h] = p; r->pso_n++; r->pso_last = h; }   // the game uses a few dozen
+    return p;
+}
+static MTLStencilOperation sop(uint32_t o)
+{
+    switch (o) { case 2: return MTLStencilOperationZero; case 3: return MTLStencilOperationReplace; case 4: return MTLStencilOperationIncrementClamp;
+    case 5: return MTLStencilOperationDecrementClamp; case 6: return MTLStencilOperationInvert; case 7: return MTLStencilOperationIncrementWrap;
+    case 8: return MTLStencilOperationDecrementWrap; default: return MTLStencilOperationKeep; }
+}
+/* depth test/write and the stencil test (D3DRS_STENCIL*: 52 enable, 53 fail, 54 z-fail, 55 pass, 56 function, 58 read
+ * mask, 59 write mask; the reference, 57, is set on the encoder) */
+static id<MTLDepthStencilState> depth_for(DSRRenderer *r)
+{
+    uint32_t en = r->rs[7] ? 1 : 0, wr = en && r->rs[14] ? 1 : 0, fn = en ? r->rs[23] : 8, st = r->rs[52] ? 1 : 0;
+    uint64_t key = (uint64_t)(en << 16 | wr << 8 | fn << 1 | 1);
+    if (st) key |= (uint64_t)1 << 20 | (uint64_t)(r->rs[53] & 15) << 24 | (uint64_t)(r->rs[54] & 15) << 28 | (uint64_t)(r->rs[55] & 15) << 32
+                 | (uint64_t)(r->rs[56] & 15) << 36 | (uint64_t)(r->rs[58] & 255) << 40 | (uint64_t)(r->rs[59] & 255) << 48;
+    uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 58);
+    while (r->dso_k[h] && r->dso_k[h] != key) h = (h + 1) & 63;
+    if (r->dso_k[h]) return r->dso_v[h];
+    id<MTLDepthStencilState> s;
+    MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new]; d.depthCompareFunction = en ? cmpf(fn) : MTLCompareFunctionAlways; d.depthWriteEnabled = wr;
+    if (st) {
+        MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+        sd.stencilCompareFunction = cmpf(r->rs[56]); sd.stencilFailureOperation = sop(r->rs[53]); sd.depthFailureOperation = sop(r->rs[54]);
+        sd.depthStencilPassOperation = sop(r->rs[55]); sd.readMask = r->rs[58] & 255; sd.writeMask = r->rs[59] & 255;
+        d.frontFaceStencil = d.backFaceStencil = sd;
+    }
+    s = [r->dev newDepthStencilStateWithDescriptor:d]; if (r->dso_n < 48) { r->dso_k[h] = key; r->dso_v[h] = s; r->dso_n++; } return s;
+}
+static id<MTLSamplerState> sampler_for(DSRRenderer *r, int st)
+{
+    uint32_t au = r->tss[st][13], av = r->tss[st][14], mag = r->tss[st][16], min = r->tss[st][17], mip = r->tss[st][18];
+    /* anisotropic filtering: textures sampled with a mip filter and a linear minification filter take up to DSR_ANISO
+     * samples along a slant (the launcher's Texture Filtering; 16 by default, 1 off); a game's own D3DTEXF_ANISOTROPIC
+     * takes its MAXANISOTROPY, at least that. With mip levels the ground keeps its detail instead of the mips' blur;
+     * the GTA games' textures have none (one level each), so far ground was one sample of the full-size image a pixel
+     * and shimmered, and the samples along the slant steady it. Point-filtered images and samplers without a mip
+     * filter (the HUD, fonts, the frame's copies for trails and glow) are left as they are */
+    static int force = -1; if (force < 0) { const char *e = getenv("DSR_ANISO"); force = e ? atoi(e) : 16; if (force < 1) force = 1; if (force > 16) force = 16; }
+    uint32_t an = (min == 3 || mag == 3) ? (r->tss[st][21] < 1 ? 1 : r->tss[st][21] > 16 ? 16 : r->tss[st][21]) : 1;
+    if (mip >= 2 && min >= 2 && an < (uint32_t)force) an = (uint32_t)force;
+    uint32_t key = ((an << 20) | (au << 16) | (av << 12) | (mag << 8) | (min << 4) | mip) << 1 | 1, h = (key * 2654435761u) >> 22;
+    while (r->smp_k[h] && r->smp_k[h] != key) h = (h + 1) & 1023;
+    if (r->smp_k[h]) return r->smp_v[h];
+    id<MTLSamplerState> s;
+    MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
+    MTLSamplerAddressMode (^am)(uint32_t) = ^MTLSamplerAddressMode(uint32_t a) { return a == 2 ? MTLSamplerAddressModeMirrorRepeat : a == 3 ? MTLSamplerAddressModeClampToEdge : a == 4 ? MTLSamplerAddressModeClampToBorderColor : MTLSamplerAddressModeRepeat; };
+    d.sAddressMode = am(au); d.tAddressMode = am(av);
+    d.magFilter = mag >= 2 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest; d.minFilter = min >= 2 ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    d.mipFilter = mip == 3 ? MTLSamplerMipFilterLinear : mip == 2 ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterNotMipmapped;
+    d.maxAnisotropy = an;
+    { static int sl = -1; if (sl < 0) sl = getenv("DSR_SAMPLERLOG") != 0;   /* development: each new sampler's filters */
+      if (sl) fprintf(stderr, "dsr: sampler mag %u min %u mip %u anisotropy %u (stage %d, address %u/%u)\n", mag, min, mip, an, st, au, av); }
+    s = [r->dev newSamplerStateWithDescriptor:d]; if (r->smp_n < 768) { r->smp_k[h] = key; r->smp_v[h] = s; r->smp_n++; } return s;
+}
+/* the normal matrix: the inverse transpose of world*view's 3x3 (row-vector order, as the other matrices) */
+static void normal_matrix(float *o, const float *m)
+{
+    float a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    float A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g, det = a * A + b * B + c * C;
+    memset(o, 0, 64); o[15] = 1;
+    if (fabsf(det) < 1e-20f) { o[0] = a; o[1] = b; o[2] = c; o[4] = d; o[5] = e; o[6] = f; o[8] = g; o[9] = h; o[10] = i; return; }
+    float k = 1.0f / det;   /* inverse transpose = cofactors / det */
+    o[0] = A * k; o[1] = B * k; o[2] = C * k;
+    o[4] = -(b * i - c * h) * k; o[5] = (a * i - c * g) * k; o[6] = -(a * h - b * g) * k;
+    o[8] = (b * f - c * e) * k; o[9] = -(a * f - c * d) * k; o[10] = (a * e - b * d) * k;
+}
+/* Direct3D's lighting inputs for this draw: the material (or the vertex colours that replace it), D3DRS_AMBIENT, and the
+ * lights that are on, moved into camera space by the view matrix */
+static void ff_lighting(DSRRenderer *r, Uniforms *u, uint32_t fvf)
+{
+    memcpy(u->md, r->material, 16); memcpy(u->ma, r->material + 4, 16); memcpy(u->ms, r->material + 8, 16); memcpy(u->me, r->material + 12, 16);
+    u->ms[3] = r->material[16];                            /* the shader reads the power from the specular colour's alpha */
+    uint32_t am = r->rs[139]; u->amb[0] = ((am >> 16) & 255) / 255.0f; u->amb[1] = ((am >> 8) & 255) / 255.0f; u->amb[2] = (am & 255) / 255.0f; u->amb[3] = (am >> 24) / 255.0f;
+    int src = 0;
+    if (r->rs[141]) {                                       /* D3DRS_COLORVERTEX: a colour the vertex has replaces the material's */
+        uint32_t s[4] = {r->rs[145], r->rs[147], r->rs[148], r->rs[146]};    /* diffuse, ambient, emissive, specular */
+        for (int k = 0; k < 4; k++) { uint32_t v = s[k]; if ((v == 1 && !(fvf & 0x40)) || (v == 2 && !(fvf & 0x80)) || v > 2) v = 0; src |= (int)v << (4 * k); }
+    }
+    u->lit[0] = 1; u->lit[2] = src; u->lit[3] = r->rs[143] != 0;
+    const float *vw = r->xf[2]; int n = 0;
+    for (int k = 0; k < 32 && n < 8; k++) {
+        if (!r->light[k].on) continue;
+        const float *L = r->light[k].v;   /* diffuse 0-3, specular 4-7, ambient 8-11, position 12-14, direction 15-17, range 18, falloff 19, att 20-22, theta 23, phi 24 */
+        float (*o)[4] = &u->lt[n * 7];
+        memcpy(o[0], L, 16); memcpy(o[1], L + 8, 16); memcpy(o[6], L + 4, 16);
+        for (int c = 0; c < 3; c++) {
+            o[2][c] = L[12] * vw[c] + L[13] * vw[4 + c] + L[14] * vw[8 + c] + vw[12 + c];
+            o[3][c] = L[15] * vw[c] + L[16] * vw[4 + c] + L[17] * vw[8 + c];
+        }
+        o[2][3] = (float)r->light[k].type; o[3][3] = 0;
+        o[4][0] = L[20]; o[4][1] = L[21]; o[4][2] = L[22]; o[4][3] = r->light[k].type == 3 ? 1e30f : L[18];
+        o[5][0] = cosf(L[23] * 0.5f); o[5][1] = cosf(L[24] * 0.5f); o[5][2] = L[19]; o[5][3] = 0;
+        n++;
+    }
+    u->lit[1] = n;
+}
+/* The depth buffer a draw needs: none when it neither tests nor writes depth or stencil (D3DRS_ZENABLE 7 off, or on with
+ * ZFUNC 23 ALWAYS and ZWRITEENABLE 14 off; STENCILENABLE 52 off) and no pass with it is open, so a pass of such draws
+ * (trails, the HUD) neither loads nor stores it */
+static uint32_t draw_ds(DSRRenderer *r)
+{
+    int uses = r->rs[52] || (r->rs[7] && (r->rs[23] != 8 || r->rs[14]));
+    if (!r->ds || uses) return r->ds;
+    if (r->enc && r->enc_rt == r->rt && r->enc_ds == r->ds) return r->ds;
+    return 0;
+}
+static void draw(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    uint32_t prim = p[0], fvf = p[1], nv = p[2], ni = p[3], stride = 0, voff, ioff = 0;
+    { int rhw = (fvf & 0xe) == 4; stride = rhw ? 16 : 12; if (fvf & 0x10) stride += 12; if (fvf & 0x40) stride += 4; if (fvf & 0x80) stride += 4;
+      for (uint32_t n = (fvf >> 8) & 0xf, k = 0; k < n; k++) { uint32_t f = (fvf >> (16 + 2 * k)) & 3; stride += f == 0 ? 8 : f == 1 ? 12 : f == 2 ? 16 : 4; } }
+    dsr_stat[0]++;
+    static int drawlog = -1; if (drawlog < 0) drawlog = getenv("DSR_DRAWLOG") != 0;
+    if (drawlog) {   /* each distinct kind of draw once (development) */
+        static uint64_t seen[512]; static int ns;
+        uint64_t key = ((uint64_t)prim << 56) ^ ((uint64_t)fvf << 24) ^ ((uint64_t)r->rs[27] << 20) ^ ((uint64_t)r->rs[19] << 12) ^ ((uint64_t)r->rs[20] << 8)
+                     ^ ((uint64_t)r->tss[0][1] << 4) ^ (uint64_t)r->tss[1][1] ^ ((uint64_t)r->rs[15] << 40) ^ ((uint64_t)r->rs[14] << 44);
+        int dup = 0; for (int k = 0; k < ns; k++) if (seen[k] == key) dup = 1;
+        if (!dup && ns < 512) { seen[ns++] = key;
+            fprintf(stderr, "draw: prim %u fvf %#x nv %u ni %u | blend %u src %u dst %u atest %u zwrite %u zfunc %u | st0 op %u/%u tci %#x ttf %#x tex %u | st1 op %u/%u ttf %#x tex %u\n",
+                    prim, fvf, nv, ni, r->rs[27], r->rs[19], r->rs[20], r->rs[15], r->rs[14], r->rs[23], r->tss[0][1], r->tss[0][4], r->tss[0][11], r->tss[0][24], r->tex[0],
+                    r->tss[1][1], r->tss[1][4], r->tss[1][24], r->tex[1]); }
+    }
+    if (!nv || 16 + (uint64_t)nv * stride + (uint64_t)ni * 2 > size) { dsr_stat[1]++; return; }   /* 64-bit: no wrap */
+    if (prim == 6 && (ni ? ni : nv) < 3) return;                                 /* a fan of fewer than 3: nothing (as D3D) */
+    { static int na = -1, nb = -1; if (na < 0) { na = nb = getenv("DSR_GLOWLOG") ? 400 : 0; } Surf *t_ = surf(r, r->rt), *x0_ = surf(r, r->tex[0]);
+      int into = t_ && t_->fxrt, add = r->rs[27] && r->rs[19] == 2 && r->rs[20] == 2 && x0_ && x0_->fxrt;
+      if ((into && na > 0) || (add && nb > 0)) { if (into) na--; else nb--; float fs, fe; memcpy(&fs, &r->rs[36], 4); memcpy(&fe, &r->rs[37], 4);
+        fprintf(stderr, "glow %s rt %u (%ux%u) fvf %x nv %u: fog %u %u/%u | blend %u %u/%u cw %x z %u/%u | tf %08x st0 %u/%u,%u a%u/%u,%u st1 %u/%u | tex0 %u\n",
+                into ? "draw into" : "add from", r->rt, t_ ? t_->w : 0, t_ ? t_->h : 0, fvf, nv, r->rs[28], r->rs[35], r->rs[140], r->rs[27], r->rs[19], r->rs[20], r->rs[168],
+                r->rs[7], r->rs[14], r->rs[60], r->tss[0][1], r->tss[0][2], r->tss[0][3], r->tss[0][4], r->tss[0][5], r->tss[0][6], r->tss[1][1], r->tss[1][4], r->tex[0]); } }
+    Surf *rt = surf(r, r->rt), *ds = surf(r, r->ds); if (!rt) { dsr_stat[2]++; return; }
+    uint32_t dz = draw_ds(r); if (!dz) ds = NULL;   /* the depth buffer, if the draw uses it */
+    ring_room(r, (uint64_t)nv * stride + (uint64_t)ni * 2 + sizeof(Uniforms)
+              + (prim == 6 ? (uint64_t)((ni ? ni : nv) - 2) * 6 : 0));
+    id<MTLRenderPipelineState> pso = pipeline_for(r, fvf, ds != NULL); if (!pso) { dsr_stat[3]++; return; }
+    id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, dz); if (!e) { dsr_stat[4]++; return; }
+    void *vdst = ring_alloc(r, nv * stride, &voff); memcpy(vdst, p + 4, nv * stride);
+    if (ni) { void *idst = ring_alloc(r, ni * 2, &ioff); memcpy(idst, (const uint8_t *)(p + 4) + nv * stride, ni * 2); }
+    e = enc_for(r, r->rt, dz);   // ring_alloc may have flushed
+    Uniforms u; memset(&u, 0, sizeof u);
+    float wv[16]; mat_mul(wv, r->xf[1], r->xf[2]); mat_mul(u.wvp, wv, r->xf[3]); memcpy(u.wv, wv, 64); memcpy(u.tex0, r->xf[16], 64); memcpy(u.tex1, r->xf[17], 64);
+    u.s1[0] = r->tss[1][11]; u.s1[1] = r->tss[1][24];
+    u.vp[0] = r->vp[0]; u.vp[1] = r->vp[1]; u.vp[2] = r->vp[2] ? r->vp[2] : rt->w; u.vp[3] = r->vp[3] ? r->vp[3] : rt->h;
+    {   /* fog: the table mode when set (Direct3D computes it per pixel; here by camera-space depth, per vertex), else the vertex mode */
+        float fs, fe, dens; memcpy(&fs, &r->rs[36], 4); memcpy(&fe, &r->rs[37], 4); memcpy(&dens, &r->rs[38], 4);
+        uint32_t fm = r->rs[35] ? r->rs[35] : r->rs[140]; if (fm > 3 || (fm == 3 && fe == fs)) fm = 0;
+        u.fog[0] = fs; u.fog[1] = fe; u.fog[2] = r->rs[28] ? (float)fm : 0; u.fog[3] = dens; }
+    uint32_t fc = r->rs[34]; u.fogcolor[0] = ((fc >> 16) & 255) / 255.0f; u.fogcolor[1] = ((fc >> 8) & 255) / 255.0f; u.fogcolor[2] = (fc & 255) / 255.0f; u.fogcolor[3] = 1;
+    uint32_t tf = r->rs[60]; u.tfactor[0] = ((tf >> 16) & 255) / 255.0f; u.tfactor[1] = ((tf >> 8) & 255) / 255.0f; u.tfactor[2] = (tf & 255) / 255.0f; u.tfactor[3] = (tf >> 24) / 255.0f;
+    u.c0[0] = r->tss[0][1]; u.c0[1] = r->tss[0][2]; u.c0[2] = r->tss[0][3]; u.c0[3] = r->tss[0][4]; u.a0[0] = r->tss[0][5]; u.a0[1] = r->tss[0][6]; u.a0[2] = r->tss[0][11]; u.a0[3] = r->tss[0][24];
+    u.c1[0] = r->tss[1][1]; u.c1[1] = r->tss[1][2]; u.c1[2] = r->tss[1][3]; u.c1[3] = r->tss[1][4]; u.a1[0] = r->tss[1][5]; u.a1[1] = r->tss[1][6];
+    u.at[0] = (r->rs[24] & 255) / 255.0f; u.at[1] = r->rs[25]; u.at[2] = r->rs[15] ? 1 : 0;
+    Surf *t0 = surf(r, r->tex[0]), *t1 = surf(r, r->tex[1]);
+    u.misc[0] = (fvf & 0xe) == 4; u.misc[1] = (fvf & 0x40) != 0; u.misc[2] = t0 != NULL; u.misc[3] = t1 != NULL;
+    memcpy(&u.lod[0], &r->tss[0][19], 4); memcpy(&u.lod[1], &r->tss[1][19], 4);   // D3DTSS_MIPMAPLODBIAS (a float); nonsense as 0
+    for (int k = 0; k < 2; k++) if (!(u.lod[k] >= -16 && u.lod[k] <= 16)) u.lod[k] = 0;
+    { static int said; if (!said && (u.lod[0] != 0 || u.lod[1] != 0)) { said = 1; fprintf(stderr, "dsr: the game sets a mip LOD bias (%g, %g)\n", u.lod[0], u.lod[1]); } }
+    normal_matrix(u.nrm, wv); u.tg[0] = r->rs[142] != 0; u.tg[1] = r->rs[29] != 0;
+    { static int ps2 = -1; if (ps2 < 0) { const char *e = getenv("GTA_LIGHTING"); ps2 = e && !strcmp(e, "ps2"); }   /* the GTA games' PS2 lighting */
+      u.tg[2] = ps2; }
+    if (r->ff_light && r->rs[137] && !u.misc[0]) ff_lighting(r, &u, fvf);
+    { static int w; uint32_t g0 = r->tss[0][11] >> 16, g1 = r->tss[1][11] >> 16;   /* texgen modes not done: sphere maps */
+      if ((g0 > 3 || (r->tss[1][1] != 1 && g1 > 3)) && !w++) fprintf(stderr, "dsr: texture coordinates generated by mode %u are not supported\n", g0 > 3 ? g0 : g1); }
+    u.xrgb[0] = t0 && t0->fmt == 2; u.xrgb[1] = t1 && t1->fmt == 2;
+    uint32_t uoff; memcpy(ring_alloc(r, sizeof u, &uoff), &u, sizeof u);   // one copy, read by both stages
+    e = enc_for(r, r->rt, dz);                                         // (ring_alloc may have flushed)
+    id<MTLDepthStencilState> dso = (dz ? depth_for(r) : r->nodepth_ds);
+    if (r->es.pso != pso) { [e setRenderPipelineState:pso]; r->es.pso = pso; }
+    if (r->es.dso != dso) { [e setDepthStencilState:dso]; r->es.dso = dso; }
+    if (r->rs[52] && r->es.sref != (r->rs[57] & 255) + 1) { [e setStencilReferenceValue:r->rs[57] & 255]; r->es.sref = (r->rs[57] & 255) + 1; }
+    uint32_t cull = r->rs[22];
+    int cm = cull == 2 ? MTLCullModeFront : cull == 3 ? MTLCullModeBack : MTLCullModeNone;   // D3DCULL_CW culls clockwise (= front here)
+    if (r->es.cull != cm) { [e setCullMode:(MTLCullMode)cm]; r->es.cull = cm; }
+    MTLViewport vp = {r->vp[0], r->vp[1], u.vp[2], u.vp[3], r->vp[4], r->vp[5] ? r->vp[5] : 1};
+    if (memcmp(&vp, &r->es.vp, sizeof vp)) { [e setViewport:vp]; r->es.vp = vp; }
+    if (!r->es.ring_bound) {
+        [e setVertexBuffer:r->ring offset:voff atIndex:0]; [e setVertexBuffer:r->white offset:0 atIndex:2]; [e setVertexBuffer:r->attr_defaults offset:0 atIndex:3];
+        [e setVertexBuffer:r->ring offset:uoff atIndex:1]; [e setFragmentBuffer:r->ring offset:uoff atIndex:1]; r->es.ring_bound = 1;
+    } else { [e setVertexBufferOffset:voff atIndex:0]; [e setVertexBufferOffset:uoff atIndex:1]; [e setFragmentBufferOffset:uoff atIndex:1]; }
+    id<MTLTexture> x0 = t0 ? tex2d(t0) : r->dummy, x1 = t1 ? tex2d(t1) : r->dummy; id<MTLSamplerState> s0 = sampler_for(r, 0), s1 = sampler_for(r, 1);
+    if (r->es.tex[0] != x0) { [e setFragmentTexture:x0 atIndex:0]; r->es.tex[0] = x0; }
+    if (r->es.smp[0] != s0) { [e setFragmentSamplerState:s0 atIndex:0]; r->es.smp[0] = s0; }
+    if (r->es.tex[1] != x1) { [e setFragmentTexture:x1 atIndex:1]; r->es.tex[1] = x1; }
+    if (r->es.smp[1] != s1) { [e setFragmentSamplerState:s1 atIndex:1]; r->es.smp[1] = s1; }
+    MTLPrimitiveType pt; uint32_t count = ni ? ni : nv;
+    switch (prim) { case 1: pt = MTLPrimitiveTypePoint; break; case 2: pt = MTLPrimitiveTypeLine; break; case 3: pt = MTLPrimitiveTypeLineStrip; break;
+                    case 5: pt = MTLPrimitiveTypeTriangleStrip; break; default: pt = MTLPrimitiveTypeTriangle; }
+    if (prim == 6) {   // triangle fan -> list
+        uint32_t tris = count - 2, ooff; uint16_t *ix = ring_alloc(r, tris * 6, &ooff);
+        const uint16_t *src = ni ? (const uint16_t *)((const uint8_t *)(p + 4) + nv * stride) : NULL;
+        for (uint32_t k = 0; k < tris; k++) { ix[k * 3] = src ? src[0] : 0; ix[k * 3 + 1] = src ? src[k + 1] : k + 1; ix[k * 3 + 2] = src ? src[k + 2] : k + 2; }
+        e = enc_for(r, r->rt, dz);
+        [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:tris * 3 indexType:MTLIndexTypeUInt16 indexBuffer:r->ring indexBufferOffset:ooff];
+    } else if (ni) [e drawIndexedPrimitives:pt indexCount:ni indexType:MTLIndexTypeUInt16 indexBuffer:r->ring indexBufferOffset:ioff];
+    else [e drawPrimitives:pt vertexStart:0 vertexCount:nv];
+}
+/* ---- effect programs ---- */
+typedef struct FxU {                   /* hlsl.c's FxU: fixed-function state an effect program reads */
+    float wvp[16], wv[16]; float vp[4], fog[4], fogcolor[4], tfactor[4], at[4];
+    int32_t misc[4], cop[8][4], aop[8][4], tex[8][4];
+} FxU;
+static void prog_create(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    uint32_t pid = p[0], kinds = p[1], len = p[2];
+    if (pid >= 1024 || size < 12 || len > size - 12) return;
+    NSString *src = [[NSString alloc] initWithBytes:p + 3 length:len encoding:NSUTF8StringEncoding]; NSError *err = nil;
+    const char *patch = getenv("DSR_FXPATCH");                           // development: "old=>new||old=>new" applied to every program's source
+    if (patch) for (NSString *one in [@(patch) componentsSeparatedByString:@"||"]) { NSArray *pp = [one componentsSeparatedByString:@"=>"];
+        if (pp.count == 2) src = [src stringByReplacingOccurrencesOfString:pp[0] withString:pp[1]]; }
+    double t0 = CACurrentMediaTime();
+    id<MTLLibrary> lib = [r->dev newLibraryWithSource:src options:[MTLCompileOptions new] error:&err];
+    r->prog[pid].vs = [lib newFunctionWithName:@"vs_fx"]; r->prog[pid].fs = [lib newFunctionWithName:@"fs_fx"]; r->prog[pid].kinds = kinds;
+    if (!r->prog[pid].vs || !r->prog[pid].fs) fprintf(stderr, "dsr: effect program %u: %s\n", pid, err ? err.localizedDescription.UTF8String : "functions missing");
+    else if (getenv("DSR_PSOLOG")) fprintf(stderr, "dsr: effect program %u compiled in %.1f ms\n", pid, (CACurrentMediaTime() - t0) * 1000);
+}
+static id<MTLRenderPipelineState> prog_pipeline(DSRRenderer *r, uint32_t mask, int has_depth)
+{
+    uint32_t blend = r->rs[27] ? 1 : 0, sb = blend ? target_bf(r, r->rs[19]) : 2, db = blend ? target_bf(r, r->rs[20]) : 1, cw = r->rs[168] & 15;
+    uint64_t key = (uint64_t)r->cur_prog << 48 | (uint64_t)mask << 32 | cw << 20 | blend << 16 | sb << 8 | db << 4 | (uint64_t)has_depth << 1 | 1;
+    if (blend) key |= (uint64_t)(blendop(r) - 1) << 24;
+    int nsm = rt_samples(r); if (nsm > 1) key ^= (uint64_t)nsm * 0x9e3779b97f4a7c15ull;
+    uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 55);
+    while (r->ppso_k[h] && r->ppso_k[h] != key) h = (h + 1) & 511;
+    if (r->ppso_k[h]) return r->ppso_v[h];
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
+    d.vertexFunction = r->prog[r->cur_prog].vs; d.fragmentFunction = r->prog[r->cur_prog].fs; d.rasterSampleCount = (NSUInteger)nsm;
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    d.colorAttachments[0].writeMask = (cw & 1 ? MTLColorWriteMaskRed : 0) | (cw & 2 ? MTLColorWriteMaskGreen : 0) | (cw & 4 ? MTLColorWriteMaskBlue : 0) | (cw & 8 ? MTLColorWriteMaskAlpha : 0);
+    if (has_depth) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    if (blend) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = bf(sb);
+                 d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor = bf(db);
+                 d.colorAttachments[0].rgbBlendOperation = d.colorAttachments[0].alphaBlendOperation = bop(r); }
+    MTLVertexDescriptor *v = [MTLVertexDescriptor vertexDescriptor]; int col = 0, ns = __builtin_popcount(mask);
+    for (int sl = 0; sl < 16; sl++) {
+        v.attributes[sl].format = MTLVertexFormatFloat4;
+        if (mask >> sl & 1) { v.attributes[sl].bufferIndex = 0; v.attributes[sl].offset = 16u * (uint32_t)col++; }
+        else { v.attributes[sl].bufferIndex = 3; v.attributes[sl].offset = 16u * (uint32_t)sl; }
+    }
+    v.layouts[0].stride = 16u * (uint32_t)(ns ? ns : 1);
+    if (ns < 16) { v.layouts[3].stride = 256; v.layouts[3].stepFunction = MTLVertexStepFunctionConstant; v.layouts[3].stepRate = 0; }   /* only if read */
+    d.vertexDescriptor = v;
+    id<MTLRenderPipelineState> pso = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!pso) { fprintf(stderr, "dsr: effect pipeline (program %u): %s\n", r->cur_prog, err.localizedDescription.UTF8String); return nil; }
+    if (r->ppso_n < 384) { r->ppso_k[h] = key; r->ppso_v[h] = pso; r->ppso_n++; }
+    return pso;
+}
+/* ---- the game's own shaders (DSR_MSL_CREATE) ---- */
+static void msl_create(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    if (size < 20) return;
+    uint32_t pid = p[0], na = p[1], vl = p[2], pl = p[3], kinds = p[4];
+    if (pid < 0x10000 || pid >= 0x10000 + 4096 || na > 16 || 20 + 8ull * na + vl + pl > size) return;
+    typeof(r->mp[0]) *m = &r->mp[pid - 0x10000]; memset(m->reg, 0, 16); memset(m->slot, 0, 16);
+    m->nattr = na; m->kinds = kinds;
+    for (uint32_t k = 0; k < na; k++) { m->reg[k] = (uint8_t)p[5 + 2 * k]; m->slot[k] = (uint8_t)p[6 + 2 * k]; }
+    const char *vs = (const char *)(p + 5 + 2 * na), *ps = pl ? vs + ((vl + 4) & ~3u) : 0; NSError *err = nil;
+    double t0 = CACurrentMediaTime();
+    id<MTLLibrary> vlib = [r->dev newLibraryWithSource:[[NSString alloc] initWithBytes:vs length:vl encoding:NSUTF8StringEncoding] options:[MTLCompileOptions new] error:&err];
+    m->vs = [vlib newFunctionWithName:@"d3dvs"];
+    if (!m->vs) { fprintf(stderr, "dsr: shader program %u (vertex): %s\n", pid, err ? err.localizedDescription.UTF8String : "no d3dvs"); return; }
+    m->fs = nil;
+    if (ps) {
+        err = nil; id<MTLLibrary> plib = [r->dev newLibraryWithSource:[[NSString alloc] initWithBytes:ps length:pl encoding:NSUTF8StringEncoding] options:[MTLCompileOptions new] error:&err];
+        m->fs = [plib newFunctionWithName:@"d3dps"];
+        if (!m->fs) { fprintf(stderr, "dsr: shader program %u (pixel): %s\n", pid, err ? err.localizedDescription.UTF8String : "no d3dps"); m->vs = nil; return; }
+    }
+    if (getenv("DSR_PSOLOG")) fprintf(stderr, "dsr: shader program %u compiled in %.1f ms\n", pid, (CACurrentMediaTime() - t0) * 1000);
+}
+/* DSR_SHADER_CONST: counts (vs/ps float4, int4, bool), then the registers; each stage's struct as MojoShader's Metal
+ * declares it: float4 uniforms_float4[], int4 uniforms_int4[], bool uniforms_bool[] (one byte each) */
+static void shader_const(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    if (size < 24) return;
+    uint32_t nf[2] = {p[0], p[1]}, ni[2] = {p[2], p[3]}, nb[2] = {p[4], p[5]};
+    uint64_t need = 24 + 16ull * (nf[0] + nf[1] + ni[0] + ni[1]) + 4ull * (nb[0] + nb[1]) + 16;
+    if (need > size || nf[0] + ni[0] > 4096 || nf[1] + ni[1] > 4096 || nb[0] > 4096 || nb[1] > 4096) return;
+    const uint8_t *w = (const uint8_t *)(p + 6);
+    const uint8_t *f[2] = {w, w + 16 * nf[0]}; w += 16 * (nf[0] + nf[1]);
+    const uint8_t *in[2] = {w, w + 16 * ni[0]}; w += 16 * (ni[0] + ni[1]);
+    const uint32_t *b[2] = {(const uint32_t *)w, (const uint32_t *)w + nb[0]}; w += 4 * (nb[0] + nb[1]);
+    for (int st = 0; st < 2; st++) {
+        uint8_t *o = r->sconst[st]; uint32_t n = 0;
+        memcpy(o, f[st], 16 * nf[st]); n += 16 * nf[st];
+        memcpy(o + n, in[st], 16 * ni[st]); n += 16 * ni[st];
+        for (uint32_t k = 0; k < nb[st]; k++) o[n + k] = b[st][k] != 0;
+        n += nb[st]; n = (n + 15) & ~15u; if (!n) { memset(o, 0, 16); n = 16; }
+        r->sconst_n[st] = n;
+    }
+    memcpy(r->salpha, w, 16);
+}
+static id<MTLRenderPipelineState> mprog_pipeline(DSRRenderer *r, uint32_t mask, int has_depth, int atest)
+{
+    typeof(r->mp[0]) *m = &r->mp[r->cur_mp - 1];
+    uint32_t blend = r->rs[27] ? 1 : 0, sb = blend ? target_bf(r, r->rs[19]) : 2, db = blend ? target_bf(r, r->rs[20]) : 1, cw = r->rs[168] & 15;
+    uint64_t key = (uint64_t)r->cur_mp << 44 | (uint64_t)mask << 28 | (uint64_t)cw << 20 | blend << 16 | sb << 10 | db << 4 | (uint64_t)atest << 2 | (uint64_t)has_depth << 1 | 1;
+    if (blend) key |= (uint64_t)(blendop(r) - 1) << 24;
+    int nsm = rt_samples(r); if (nsm > 1) key ^= (uint64_t)nsm * 0x9e3779b97f4a7c15ull;
+    FsKey fk = fs_key(r, 1); if (!m->fs) { key ^= fs_hash(fk); if (!key) key = 1; }
+    uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 52);
+    while (r->mpso_k[h] && r->mpso_k[h] != key) h = (h + 1) & 4095;
+    if (r->mpso_k[h]) return r->mpso_v[h];
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
+    d.vertexFunction = m->vs; d.rasterSampleCount = (NSUInteger)nsm;
+    if (m->fs) d.fragmentFunction = m->fs;
+    else d.fragmentFunction = fs_main_for(r, atest, fk);
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    d.colorAttachments[0].writeMask = (cw & 1 ? MTLColorWriteMaskRed : 0) | (cw & 2 ? MTLColorWriteMaskGreen : 0) | (cw & 4 ? MTLColorWriteMaskBlue : 0) | (cw & 8 ? MTLColorWriteMaskAlpha : 0);
+    if (has_depth) d.depthAttachmentPixelFormat = d.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    if (blend) { d.colorAttachments[0].blendingEnabled = YES; d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = bf(sb);
+                 d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor = bf(db);
+                 d.colorAttachments[0].rgbBlendOperation = d.colorAttachments[0].alphaBlendOperation = bop(r); }
+    /* each input register from its slot in the draw's float4 vertex (slots in mask order), or zeros */
+    MTLVertexDescriptor *v = [MTLVertexDescriptor vertexDescriptor]; int zeros = 0, ns = __builtin_popcount(mask);
+    for (uint32_t k = 0; k < m->nattr; k++) {
+        uint32_t reg = m->reg[k], sl = m->slot[k]; if (reg >= 16) continue;
+        v.attributes[reg].format = MTLVertexFormatFloat4;
+        if (mask >> sl & 1) { v.attributes[reg].bufferIndex = 30; v.attributes[reg].offset = 16u * (uint32_t)__builtin_popcount(mask & ((1u << sl) - 1)); }
+        else { v.attributes[reg].bufferIndex = 29; v.attributes[reg].offset = 0; zeros = 1; }
+    }
+    v.layouts[30].stride = 16u * (uint32_t)(ns ? ns : 1);
+    if (zeros) { v.layouts[29].stride = 16; v.layouts[29].stepFunction = MTLVertexStepFunctionConstant; v.layouts[29].stepRate = 0; }
+    d.vertexDescriptor = v;
+    id<MTLRenderPipelineState> pso = [r->dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!pso) { static int n; if (n++ < 10) fprintf(stderr, "dsr: shader pipeline (program %u): %s\n", r->cur_mp - 1 + 0x10000, err.localizedDescription.UTF8String); return nil; }
+    if (r->mpso_n >= 3072) { static int w; if (!w++) fprintf(stderr, "dsr: shader pipeline cache full (3072): new pipelines are no longer kept\n"); }
+    if (r->mpso_n < 3072) { r->mpso_k[h] = key; r->mpso_v[h] = pso; r->mpso_n++; }
+    return pso;
+}
+static void draw_mprog(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    uint32_t prim = p[0], mask = p[1] & 0xffff, nv = p[2], ni = p[3], ns = (uint32_t)__builtin_popcount(mask), stride = 16 * ns, voff, ioff = 0;
+    dsr_stat[0]++;
+    if (!nv || !ns || 20 + (uint64_t)nv * stride + (uint64_t)ni * 2 > size) { dsr_stat[1]++; return; }
+    if (prim == 6 && (ni ? ni : nv) < 3) return;
+    typeof(r->mp[0]) *m = &r->mp[r->cur_mp - 1]; if (!m->vs) return;
+    Surf *rt = surf(r, r->rt), *ds = surf(r, r->ds); if (!rt) { dsr_stat[2]++; return; }
+    uint32_t dz = draw_ds(r); if (!dz) ds = NULL;   /* the depth buffer, if the draw uses it */
+    ring_room(r, (uint64_t)nv * stride + (uint64_t)ni * 2 + r->sconst_n[0] + r->sconst_n[1] + sizeof(Uniforms) + 256
+              + (prim == 6 ? (uint64_t)((ni ? ni : nv) - 2) * 6 : 0));
+    int atest = r->rs[15] != 0;
+    id<MTLRenderPipelineState> pso = mprog_pipeline(r, mask, ds != NULL, atest); if (!pso) { dsr_stat[3]++; return; }
+    void *vdst = ring_alloc(r, nv * stride, &voff); memcpy(vdst, p + 5, nv * stride);
+    if (ni) { void *idst = ring_alloc(r, ni * 2, &ioff); memcpy(idst, (const uint8_t *)(p + 5) + nv * stride, ni * 2); }
+    uint32_t c0off, c1off = 0, uoff = 0;
+    memcpy(ring_alloc(r, r->sconst_n[0], &c0off), r->sconst[0], r->sconst_n[0]);
+    if (m->fs) memcpy(ring_alloc(r, r->sconst_n[1], &c1off), r->sconst[1], r->sconst_n[1]);
+    float vpw = r->vp[2] ? r->vp[2] : rt->w, vph = r->vp[3] ? r->vp[3] : rt->h;
+    struct { float pixfix[4], fog[4]; } x; memset(&x, 0, sizeof x);
+    x.pixfix[0] = 1.0f / vpw; x.pixfix[1] = -1.0f / vph;            /* D3D9's pixel centres, as vs_main */
+    x.pixfix[2] = r->rs[28] ? 1 : 0;                                    /* D3DRS_FOGENABLE */
+    x.pixfix[3] = r->rs[35] && r->rs[35] <= 3 ? 1 : 0;                  /* D3DRS_FOGTABLEMODE: by depth, not the shader's oFog */
+    {   float fs, fe, dens; memcpy(&fs, &r->rs[36], 4); memcpy(&fe, &r->rs[37], 4); memcpy(&dens, &r->rs[38], 4);
+        uint32_t fm = r->rs[35] ? r->rs[35] : r->rs[140]; if (fm > 3 || (fm == 3 && fe == fs)) fm = 0;
+        x.fog[0] = fs; x.fog[1] = fe; x.fog[2] = r->rs[28] ? (float)fm : 0; x.fog[3] = dens; }
+    Surf *t0 = surf(r, r->tex[0]), *t1 = surf(r, r->tex[1]);
+    if (!m->fs) {   /* the fixed-function stages: fs_main's uniforms, as draw() sets them */
+        Uniforms u; memset(&u, 0, sizeof u);
+        u.vp[0] = r->vp[0]; u.vp[1] = r->vp[1]; u.vp[2] = vpw; u.vp[3] = vph;
+        memcpy(u.fog, x.fog, 16);
+        uint32_t fc = r->rs[34]; u.fogcolor[0] = ((fc >> 16) & 255) / 255.0f; u.fogcolor[1] = ((fc >> 8) & 255) / 255.0f; u.fogcolor[2] = (fc & 255) / 255.0f; u.fogcolor[3] = 1;
+        uint32_t tf = r->rs[60]; u.tfactor[0] = ((tf >> 16) & 255) / 255.0f; u.tfactor[1] = ((tf >> 8) & 255) / 255.0f; u.tfactor[2] = (tf & 255) / 255.0f; u.tfactor[3] = (tf >> 24) / 255.0f;
+        u.c0[0] = r->tss[0][1]; u.c0[1] = r->tss[0][2]; u.c0[2] = r->tss[0][3]; u.c0[3] = r->tss[0][4]; u.a0[0] = r->tss[0][5]; u.a0[1] = r->tss[0][6];
+        u.c1[0] = r->tss[1][1]; u.c1[1] = r->tss[1][2]; u.c1[2] = r->tss[1][3]; u.c1[3] = r->tss[1][4]; u.a1[0] = r->tss[1][5]; u.a1[1] = r->tss[1][6];
+        u.at[0] = (r->rs[24] & 255) / 255.0f; u.at[1] = r->rs[25]; u.at[2] = r->rs[15] ? 1 : 0;
+        u.misc[1] = 1; u.misc[2] = t0 != NULL; u.misc[3] = t1 != NULL;
+        memcpy(&u.lod[0], &r->tss[0][19], 4); memcpy(&u.lod[1], &r->tss[1][19], 4);   // D3DTSS_MIPMAPLODBIAS (a float); nonsense as 0
+        for (int k = 0; k < 2; k++) if (!(u.lod[k] >= -16 && u.lod[k] <= 16)) u.lod[k] = 0;
+        u.xrgb[0] = t0 && t0->fmt == 2; u.xrgb[1] = t1 && t1->fmt == 2;
+        memcpy(ring_alloc(r, sizeof u, &uoff), &u, sizeof u);
+    }
+    id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, dz); if (!e) { dsr_stat[4]++; return; }   /* (ring_alloc may have flushed) */
+    [e setRenderPipelineState:pso]; [e setDepthStencilState:(dz ? depth_for(r) : r->nodepth_ds)];
+    if (r->rs[52]) [e setStencilReferenceValue:r->rs[57] & 255];
+    uint32_t cull = r->rs[22]; [e setCullMode:cull == 2 ? MTLCullModeFront : cull == 3 ? MTLCullModeBack : MTLCullModeNone];
+    [e setViewport:(MTLViewport){r->vp[0], r->vp[1], vpw, vph, r->vp[4], r->vp[5] ? r->vp[5] : 1}];
+    [e setVertexBuffer:r->ring offset:voff atIndex:30]; [e setVertexBuffer:r->attr_defaults offset:0 atIndex:29];
+    [e setVertexBuffer:r->ring offset:c0off atIndex:0]; [e setVertexBytes:&x length:sizeof x atIndex:1];
+    if (m->fs) {
+        [e setFragmentBuffer:r->ring offset:c1off atIndex:0]; [e setFragmentBytes:r->salpha length:16 atIndex:1];
+        for (int k = 0; k < 8; k++) {
+            uint32_t kind = (m->kinds >> (2 * k)) & 3; Surf *t = surf(r, r->tex[k]);
+            id<MTLTexture> tx = kind == 1 ? r->dummy_cube : kind == 2 ? r->dummy_3d : (t ? tex2d(t) : r->dummy);
+            if (kind == 1 && t && t->tex.textureType == MTLTextureTypeCube) tx = t->tex;
+            [e setFragmentTexture:tx atIndex:(NSUInteger)k]; [e setFragmentSamplerState:sampler_for(r, k) atIndex:(NSUInteger)k];
+        }
+    } else {
+        [e setFragmentBuffer:r->ring offset:uoff atIndex:1];
+        [e setFragmentTexture:t0 ? tex2d(t0) : r->dummy atIndex:0]; [e setFragmentSamplerState:sampler_for(r, 0) atIndex:0];
+        [e setFragmentTexture:t1 ? tex2d(t1) : r->dummy atIndex:1]; [e setFragmentSamplerState:sampler_for(r, 1) atIndex:1];
+    }
+    memset(&r->es, 0, sizeof r->es); r->es.cull = -1;                     /* the fixed-function path sets its state again */
+    MTLPrimitiveType pt; uint32_t count = ni ? ni : nv;
+    switch (prim) { case 1: pt = MTLPrimitiveTypePoint; break; case 2: pt = MTLPrimitiveTypeLine; break; case 3: pt = MTLPrimitiveTypeLineStrip; break;
+                    case 5: pt = MTLPrimitiveTypeTriangleStrip; break; default: pt = MTLPrimitiveTypeTriangle; }
+    if (prim == 6) {   /* fans as triangle lists */
+        uint32_t tris = count - 2, ooff; uint16_t *ix = ring_alloc(r, tris * 6, &ooff);
+        const uint16_t *src = ni ? (const uint16_t *)((const uint8_t *)(p + 5) + nv * stride) : NULL;
+        for (uint32_t k = 0; k < tris; k++) { ix[k * 3] = src ? src[0] : 0; ix[k * 3 + 1] = src ? src[k + 1] : (uint16_t)(k + 1); ix[k * 3 + 2] = src ? src[k + 2] : (uint16_t)(k + 2); }
+        e = enc_for(r, r->rt, dz);
+        [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:tris * 3 indexType:MTLIndexTypeUInt16 indexBuffer:r->ring indexBufferOffset:ooff];
+    } else if (ni) [e drawIndexedPrimitives:pt indexCount:ni indexType:MTLIndexTypeUInt16 indexBuffer:r->ring indexBufferOffset:ioff];
+    else [e drawPrimitives:pt vertexStart:0 vertexCount:nv];
+}
+static void draw_prog(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    uint32_t prim = p[0], mask = p[1] & 0xffff, nv = p[2], ni = p[3], pretrans = p[4], ns = (uint32_t)__builtin_popcount(mask), stride = 16 * ns, voff, ioff = 0;
+    dsr_stat[0]++;
+    if (!nv || !ns || 20 + (uint64_t)nv * stride + (uint64_t)ni * 2 > size) { dsr_stat[1]++; return; }
+    if (prim == 6 && (ni ? ni : nv) < 3) return;
+    if (r->cur_prog >= 1024 || !r->prog[r->cur_prog].vs) return;
+    Surf *rt = surf(r, r->rt), *ds = surf(r, r->ds); if (!rt) { dsr_stat[2]++; return; }
+    uint32_t dz = draw_ds(r); if (!dz) ds = NULL;   /* the depth buffer, if the draw uses it */
+    ring_room(r, (uint64_t)nv * stride + (uint64_t)ni * 2 + (uint64_t)(r->npconst ? r->npconst : 1) * 16
+              + (prim == 6 ? (uint64_t)((ni ? ni : nv) - 2) * 6 : 0));
+    id<MTLRenderPipelineState> pso = prog_pipeline(r, mask, ds != NULL); if (!pso) { dsr_stat[3]++; return; }
+    id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, dz); if (!e) { dsr_stat[4]++; return; }
+    void *vdst = ring_alloc(r, nv * stride, &voff); memcpy(vdst, p + 5, nv * stride);
+    if (ni) { void *idst = ring_alloc(r, ni * 2, &ioff); memcpy(idst, (const uint8_t *)(p + 5) + nv * stride, ni * 2); }
+    FxU u; memset(&u, 0, sizeof u);
+    float wv[16]; mat_mul(wv, r->xf[1], r->xf[2]); mat_mul(u.wvp, wv, r->xf[3]); memcpy(u.wv, wv, 64);
+    u.vp[0] = r->vp[0]; u.vp[1] = r->vp[1]; u.vp[2] = r->vp[2] ? r->vp[2] : rt->w; u.vp[3] = r->vp[3] ? r->vp[3] : rt->h;
+    { float fs, fe; memcpy(&fs, &r->rs[36], 4); memcpy(&fe, &r->rs[37], 4); u.fog[0] = fs; u.fog[1] = fe; u.fog[2] = r->rs[28] ? 1 : 0; }
+    uint32_t fc = r->rs[34]; u.fogcolor[0] = ((fc >> 16) & 255) / 255.0f; u.fogcolor[1] = ((fc >> 8) & 255) / 255.0f; u.fogcolor[2] = (fc & 255) / 255.0f; u.fogcolor[3] = 1;
+    uint32_t tf = r->rs[60]; u.tfactor[0] = ((tf >> 16) & 255) / 255.0f; u.tfactor[1] = ((tf >> 8) & 255) / 255.0f; u.tfactor[2] = (tf & 255) / 255.0f; u.tfactor[3] = (tf >> 24) / 255.0f;
+    u.at[0] = (r->rs[24] & 255) / 255.0f; u.at[1] = r->rs[25]; u.at[2] = r->rs[15] ? 1 : 0;
+    u.misc[0] = (int32_t)(pretrans & 1);
+    for (int st = 0; st < 8; st++) {
+        u.cop[st][0] = (int32_t)r->tss[st][1]; u.cop[st][1] = (int32_t)r->tss[st][2]; u.cop[st][2] = (int32_t)r->tss[st][3]; u.cop[st][3] = (int32_t)r->tss[st][4];
+        u.aop[st][0] = (int32_t)r->tss[st][5]; u.aop[st][1] = (int32_t)r->tss[st][6]; u.aop[st][3] = (int32_t)r->tss[st][11];
+        Surf *t = surf(r, r->tex[st]); u.tex[st][0] = t != NULL; u.tex[st][1] = t && t->fmt == 2;
+    }
+    e = enc_for(r, r->rt, dz);                                         // (ring_alloc may have flushed)
+    [e setRenderPipelineState:pso]; [e setDepthStencilState:(dz ? depth_for(r) : r->nodepth_ds)];
+    if (r->rs[52]) [e setStencilReferenceValue:r->rs[57] & 255];
+    uint32_t cull = r->rs[22]; [e setCullMode:cull == 2 ? MTLCullModeFront : cull == 3 ? MTLCullModeBack : MTLCullModeNone];
+    [e setViewport:(MTLViewport){r->vp[0], r->vp[1], u.vp[2], u.vp[3], r->vp[4], r->vp[5] ? r->vp[5] : 1}];
+    [e setVertexBuffer:r->ring offset:voff atIndex:0]; [e setVertexBuffer:r->attr_defaults offset:0 atIndex:3];
+    [e setVertexBytes:&u length:sizeof u atIndex:1]; [e setFragmentBytes:&u length:sizeof u atIndex:1];
+    uint32_t nc = r->npconst ? r->npconst : 1, coff;
+    void *cdst = ring_alloc(r, 16 * nc, &coff); memcpy(cdst, r->pconst, 16 * nc);
+    e = enc_for(r, r->rt, dz);
+    [e setVertexBuffer:r->ring offset:coff atIndex:2]; [e setFragmentBuffer:r->ring offset:coff atIndex:2];
+    [e setVertexBuffer:r->ring offset:voff atIndex:0];
+    for (int k = 0; k < 8; k++) {                                         // texture/sampler slots (the device's stages)
+        uint32_t kind = (r->prog[r->cur_prog].kinds >> (2 * k)) & 3; Surf *t = surf(r, r->tex[k]);
+        id<MTLTexture> x = kind == 1 ? r->dummy_cube : kind == 2 ? r->dummy_3d : (t ? tex2d(t) : r->dummy);
+        if (kind == 1 && t && t->tex.textureType == MTLTextureTypeCube) x = t->tex;
+        [e setFragmentTexture:x atIndex:(NSUInteger)k]; [e setFragmentSamplerState:sampler_for(r, k) atIndex:(NSUInteger)k];
+    }
+    if (rt->w == 256 && rt->h == 256) rt->fxrt = 1;
+    { static int n = -1; if (n < 0) n = getenv("DSR_GLOWLOG") ? 600 : 0;
+      if (n > 0 && rt->w == 256) { n--; Surf *t0 = surf(r, r->tex[0]);
+        fprintf(stderr, "glow prog %u rt %u (%ux%u) vp %.0fx%.0f mask %04x nv %u pre %u | blend %u %u/%u | tex0 %u %ux%u%s\n", r->cur_prog, r->rt, rt->w, rt->h, r->vp[2], r->vp[3],
+                mask, nv, pretrans, r->rs[27], r->rs[19], r->rs[20], r->tex[0], t0 ? t0->w : 0, t0 ? t0->h : 0, t0 ? "" : " (none: white)"); } }
+    static int tlog = -1; if (tlog < 0) tlog = getenv("DSR_FXTEXLOG") ? atoi(getenv("DSR_FXTEXLOG")) : 0;
+    { static int n = -1; if (n < 0) n = getenv("DSR_RTLOG") ? atoi(getenv("DSR_RTLOG")) : 0; static uint32_t lastp; static int lastf;
+      if (n > 0 && r->rs[28] && (r->cur_prog != lastp || dsr_frame != lastf)) { n--; lastp = r->cur_prog; lastf = dsr_frame; fprintf(stderr, "dsr: frame %d: program %u draws into %u after %ld draws\n", dsr_frame, r->cur_prog, r->rt, dsr_stat[0]); } }
+    if (tlog > 0) { tlog--; { float fs, fe, fd; memcpy(&fs, &r->rs[36], 4); memcpy(&fe, &r->rs[37], 4); memcpy(&fd, &r->rs[38], 4);
+                                fprintf(stderr, "dsr: fog enable %u table %u vertex %u range %u start %g end %g density %g colour %08x; alpha test %u ref %u func %u; blend %u %u/%u\n", r->rs[28], r->rs[35], r->rs[140], r->rs[48], fs, fe, fd, r->rs[34], r->rs[15], r->rs[24], r->rs[25], r->rs[27], r->rs[19], r->rs[20]); }
+                    fprintf(stderr, "dsr: program %u draws with", r->cur_prog);
+        for (int k = 0; k < 8; k++) { Surf *t = surf(r, r->tex[k]); if (t) fprintf(stderr, " [%d] %u %ux%u%s%s", k, r->tex[k], t->w, t->h, t->tex.textureType == MTLTextureTypeCube ? " cube" : "", t->tex ? "" : " (no texture)"); else if (r->tex[k]) fprintf(stderr, " [%d] %u (unknown)", k, r->tex[k]); }
+        fprintf(stderr, "\n"); }
+    memset(&r->es, 0, sizeof r->es); r->es.cull = -1;                     // the fixed-function path sets its state again
+    MTLPrimitiveType pt; uint32_t count = ni ? ni : nv;
+    switch (prim) { case 1: pt = MTLPrimitiveTypePoint; break; case 2: pt = MTLPrimitiveTypeLine; break; case 3: pt = MTLPrimitiveTypeLineStrip; break;
+                    case 5: pt = MTLPrimitiveTypeTriangleStrip; break; default: pt = MTLPrimitiveTypeTriangle; }
+    if (prim == 6) {
+        uint32_t tris = count - 2, ooff; uint16_t *ix = ring_alloc(r, tris * 6, &ooff);
+        const uint16_t *src = ni ? (const uint16_t *)((const uint8_t *)(p + 5) + nv * stride) : NULL;
+        for (uint32_t k = 0; k < tris; k++) { ix[k * 3] = src ? src[0] : 0; ix[k * 3 + 1] = src ? src[k + 1] : (uint16_t)(k + 1); ix[k * 3 + 2] = src ? src[k + 2] : (uint16_t)(k + 2); }
+        e = enc_for(r, r->rt, dz);
+        [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:tris * 3 indexType:MTLIndexTypeUInt16 indexBuffer:r->ring indexBufferOffset:ooff];
+    } else if (ni) [e drawIndexedPrimitives:pt indexCount:ni indexType:MTLIndexTypeUInt16 indexBuffer:r->ring indexBufferOffset:ioff];
+    else [e drawPrimitives:pt vertexStart:0 vertexCount:nv];
+}
+static void clear_rect(DSRRenderer *r, uint32_t flags, uint32_t color, float z, uint32_t stencil, const int32_t *rc, int has_ds)
+{
+    if (flags & 1) quad(r, r->rt, rc, 0, rc, 1, color);                          // D3DCLEAR_TARGET
+    if ((flags & 6) && has_ds) {                                                // D3DCLEAR_ZBUFFER, D3DCLEAR_STENCIL
+        id<MTLRenderCommandEncoder> e = enc_for(r, r->rt, r->ds); float zz[4] = {z, 0, 0, 0};
+        [e setRenderPipelineState:r->hz[sidx(rt_samples(r))]]; [e setDepthStencilState:r->zsclear_ds[(flags >> 1) & 3]]; [e setCullMode:MTLCullModeNone];
+        if (flags & 4) [e setStencilReferenceValue:stencil & 255];
+        [e setViewport:(MTLViewport){rc[0], rc[1], rc[2] - rc[0], rc[3] - rc[1], 0, 1}];
+        [e setVertexBytes:zz length:16 atIndex:0]; [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        memset(&r->es, 0, sizeof r->es); r->es.cull = -1;
+    }
+}
+
+static void clear(DSRRenderer *r, const uint32_t *p, uint32_t size)
+{
+    uint32_t flags = p[0], color = p[1]; float z; memcpy(&z, &p[2], 4);
+    Surf *rt = surf(r, r->rt), *ds = surf(r, r->ds); if (!rt) return;
+    if (dsr_verbose) fprintf(stderr, "clear flags %x color %08x rt %u (%ux%u fmt %u usage %lx) ds %u vp %.0f %.0f %.0f %.0f\n", flags, color, r->rt, rt->w, rt->h, rt->fmt, (unsigned long)rt->tex.usage, r->ds, r->vp[0], r->vp[1], r->vp[2], r->vp[3]);
+    int32_t full[4] = {(int32_t)r->vp[0], (int32_t)r->vp[1], (int32_t)(r->vp[0] + (r->vp[2] ? r->vp[2] : rt->w)), (int32_t)(r->vp[1] + (r->vp[3] ? r->vp[3] : rt->h))};
+    full[0] = full[0] > 0 ? full[0] : 0; full[1] = full[1] > 0 ? full[1] : 0;
+    full[2] = full[2] < (int32_t)rt->w ? full[2] : (int32_t)rt->w; full[3] = full[3] < (int32_t)rt->h ? full[3] : (int32_t)rt->h;
+    // D3D clears only the given rects (each clipped to the viewport), or the whole viewport when there are none. The game
+    // relies on it: the inventory's paper doll is kept inside its box by clearing depth to 0 everywhere, then to 1 in the
+    // box, before drawing the doll.
+    uint32_t nr = size >= 20 ? p[4] : 0; if (nr > (size - 20) / 16) nr = 0;
+    if (!nr && !full[0] && !full[1] && full[2] == (int32_t)rt->w && full[3] == (int32_t)rt->h && (flags & 7) &&
+        !(r->enc && r->enc_rt == r->rt && r->enc_ds == (ds ? r->ds : 0)) && (rt->tex.usage & MTLTextureUsageRenderTarget) && rt->fmt != 3 &&
+        (!ds || (ds->w == rt->w && ds->h == rt->h))) {   /* the whole target, before anything is drawn into it: the pass starts with it */
+        r->pend_flags = flags & (ds ? 7 : 1); r->pend_color = color; r->pend_z = z; r->pend_stencil = size >= 16 ? p[3] : 0;
+        if (r->pend_flags) { enc_for(r, r->rt, r->ds); r->pend_flags = 0; return; }
+    }
+    for (uint32_t k = 0; k < (nr ? nr : 1); k++) {
+        int32_t rc[4]; memcpy(rc, nr ? (const int32_t *)(p + 5 + 4 * k) : full, 16);
+        if (rc[0] < full[0]) rc[0] = full[0];
+        if (rc[1] < full[1]) rc[1] = full[1];
+        if (rc[2] > full[2]) rc[2] = full[2];
+        if (rc[3] > full[3]) rc[3] = full[3];
+        if (rc[2] > rc[0] && rc[3] > rc[1]) clear_rect(r, flags, color, z, p[3], rc, ds != 0);
+    }
+    if (getenv("DSR_CHECKCLEAR")) {
+        static int n; if (n++ < 4) {
+            id<MTLBuffer> b = [r->dev newBufferWithLength:4 options:MTLResourceStorageModeShared]; end_enc(r);
+            id<MTLBlitCommandEncoder> be = [cmdbuf(r) blitCommandEncoder];
+            [be copyFromTexture:rt->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(100, 100, 0) sourceSize:MTLSizeMake(1, 1, 1) toBuffer:b destinationOffset:0 destinationBytesPerRow:4 destinationBytesPerImage:4];
+            [be endEncoding]; dsr_renderer_flush(r, 1);
+            fprintf(stderr, "after clear %d: px %08x, cb status %ld err %s\n", n, *(uint32_t *)b.contents, (long)r->last_cb.status, r->last_cb.error.localizedDescription.UTF8String ?: "-"); } }
+}
+
+static long prof_waits;   /* DSR_PROFILE: the times the CPU waited for the GPU (readbacks) */
+void dsr_renderer_flush(DSRRenderer *r, int wait)
+{
+    if (wait) prof_waits++;
+    commit(r);
+    if (wait && r->last_cb) [r->last_cb waitUntilCompleted];
+}
+// Encode "presented surface -> dst" (gamma applied) into the current command buffer; returns that command buffer,
+// uncommitted, so the caller can attach presentDrawable / completion handlers and then call dsr_renderer_flush.
+id<MTLCommandBuffer> dsr_renderer_present_to(DSRRenderer *r, id<MTLTexture> dst)
+{
+    Surf *s = surf(r, r->presented); if (!s) return nil;
+    r->ending_frame = 1; end_enc(r); r->ending_frame = 0;   /* the frame's last pass (see Surf) */
+    resolve(r, s);
+    if (r->gamma_dirty) {
+        uint16_t px[256][4];
+        for (int k = 0; k < 256; k++) { px[k][0] = r->gamma[0][k]; px[k][1] = r->gamma[1][k]; px[k][2] = r->gamma[2][k]; px[k][3] = 0xffff; }
+        [r->gamma_lut replaceRegion:MTLRegionMake1D(0, 256) mipmapLevel:0 withBytes:px bytesPerRow:sizeof px];
+        r->gamma_dirty = 0;
+    }
+    end_enc(r); prof_print(); ring_log(); prof_cut(r, "present");
+    if (dsr_prof > 0 && dsr_frame % 240 == 0) fprintf(stderr, "dsr profile: pipelines %d, shader pipelines %d, fs_main variants %d\n", r->pso_n, r->mpso_n, r->fsf_n);
+    MTLRenderPassDescriptor *p = [MTLRenderPassDescriptor renderPassDescriptor];
+    p.colorAttachments[0].texture = dst; p.colorAttachments[0].loadAction = MTLLoadActionDontCare; p.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cmdbuf(r) renderCommandEncoderWithDescriptor:p];
+    [e setRenderPipelineState:r->present_pso];
+    [e setFragmentTexture:s->tex atIndex:0]; [e setFragmentTexture:r->gamma_lut atIndex:1];
+    uint32_t pm[4] = {(uint32_t)r->dither16, s->w, s->h, 0}; [e setFragmentBytes:pm length:sizeof pm atIndex:0];
+    [e setFragmentSamplerState:(dst.width == s->w && dst.height == s->h) ? r->point_clamp : r->linear_clamp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    if (r->g_on) {   // frame-time graph, bottom-left: 240 columns, 0..40 ms
+        if (!r->graph_pso) {
+            MTLRenderPipelineDescriptor *gd = [MTLRenderPipelineDescriptor new]; NSError *err = nil;
+            gd.vertexFunction = [r->lib newFunctionWithName:@"vs_present"]; gd.fragmentFunction = [r->lib newFunctionWithName:@"fs_graph"];
+            gd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm; gd.colorAttachments[0].blendingEnabled = YES;
+            gd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha; gd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            r->graph_pso = [r->dev newRenderPipelineStateWithDescriptor:gd error:&err];
+            if (!r->graph_pso) fprintf(stderr, "graph pipeline: %s\n", err.localizedDescription.UTF8String);
+        }
+        if (r->graph_pso) {
+            float g[2 * 240 + 4]; int k;
+            for (k = 0; k < 240; k++) { g[k] = r->g_a[(r->g_ha + k) % 240]; g[240 + k] = r->g_b[(r->g_hb + k) % 240]; }
+            double w = dst.width * 0.36, h = dst.height * 0.22;
+            [e setViewport:(MTLViewport){8, dst.height - h - 8, w, h, 0, 1}];
+            [e setRenderPipelineState:r->graph_pso];
+            [e setFragmentBytes:g length:sizeof g atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+    }
+    [e endEncoding];
+    return r->cb;
+}
+void dsr_renderer_set_readback(DSRRenderer *r, void *area, size_t size, volatile uint32_t *done)
+{
+    r->rb_buf = [r->dev newBufferWithBytesNoCopy:area length:size options:MTLResourceStorageModeShared deallocator:nil]; r->rb_done = done;
+}
+static void readback(DSRRenderer *r, const uint32_t *p)
+{
+    Surf *s = surf(r, p[0]); uint32_t x = p[1], y = p[2], w = p[3], h = p[4]; int ok = 0;
+    if (s && r->rb_buf && s->fmt != 3 && w && h && (uint64_t)x + w <= s->w && (uint64_t)y + h <= s->h && (uint64_t)w * h * 4 <= r->rb_buf.length) {
+        resolve(r, s);
+        if (r->enc) end_enc(r);
+        [blit_enc(r) copyFromTexture:s->tex sourceSlice:s->slice sourceLevel:s->level sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
+                             toBuffer:r->rb_buf destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
+        dsr_renderer_flush(r, 1); ok = 1;
+    }
+    if (r->rb_done) __atomic_store_n(r->rb_done, ok ? p[5] : p[5] | 0x80000000u, __ATOMIC_RELEASE);   /* high bit: not done */
+}
+/* DSR_DEPTH_READBACK: the depth part of a depth/stencil surface as floats, into the readback area */
+static void depth_readback(DSRRenderer *r, const uint32_t *p)
+{
+    Surf *s = surf(r, p[0]); uint32_t x = p[1], y = p[2], w = p[3], h = p[4]; int ok = 0;
+    if (s && r->rb_buf && s->fmt == 3 && w && h && (uint64_t)x + w <= s->w && (uint64_t)y + h <= s->h && (uint64_t)w * h * 4 <= r->rb_buf.length) {
+        if (r->enc) end_enc(r);
+        [blit_enc(r) copyFromTexture:s->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
+                             toBuffer:r->rb_buf destinationOffset:0 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4 options:MTLBlitOptionDepthFromDepthStencil];
+        dsr_renderer_flush(r, 1); ok = 1;
+    }
+    if (r->rb_done) __atomic_store_n(r->rb_done, ok ? p[5] : p[5] | 0x80000000u, __ATOMIC_RELEASE);
+}
+double dsr_renderer_present_time(DSRRenderer *r) { return r->present_ts; }
+void dsr_renderer_set_graph(DSRRenderer *r, const float *a, int ha, const float *b, int hb) { r->g_a = a; r->g_ha = ha; r->g_b = b; r->g_hb = hb; r->g_on = 1; }
+void dsr_renderer_presented_size(DSRRenderer *r, uint32_t *w, uint32_t *h) { Surf *s = surf(r, r->presented); *w = s ? s->w : 0; *h = s ? s->h : 0; }
+id<MTLTexture> dsr_renderer_rt(DSRRenderer *r) { Surf *s = surf(r, r->rt); resolve(r, s); return s ? s->tex : nil; }
+id<MTLTexture> dsr_renderer_presented(DSRRenderer *r) { Surf *s = surf(r, r->presented); resolve(r, s); return s ? s->tex : nil; }
+
+int dsr_renderer_exec(DSRRenderer *r, uint32_t op, const uint8_t *pl, uint32_t size)
+{
+    const uint32_t *p = (const uint32_t *)pl;
+    switch (op) {
+    case DSR_RENDER_STATE: if (p[0] < 256) r->rs[p[0]] = p[1]; break;
+    case DSR_TSS: if (p[0] < 8 && p[1] < 32) { r->tss[p[0]][p[1]] = p[2]; if (p[1] == 12) r->tss[p[0]][13] = r->tss[p[0]][14] = p[2]; } break;
+    case DSR_TEXTURE: if (p[0] < 8) r->tex[p[0]] = p[1]; break;
+    case DSR_TRANSFORM: if (p[0] < 32) memcpy(r->xf[p[0]], p + 1, 64); break;
+    case DSR_VIEWPORT: r->vp[0] = p[0]; r->vp[1] = p[1]; r->vp[2] = p[2]; r->vp[3] = p[3]; memcpy(&r->vp[4], p + 4, 8); break;
+    case DSR_CLEAR: { static int n = -1; if (n < 0) n = getenv("DSR_RTLOG") ? atoi(getenv("DSR_RTLOG")) : 0;
+        Surf *t = surf(r, r->rt); if (n > 0 && t && t->kind == 3) { n--; fprintf(stderr, "dsr: clear of %u: flags %x colour %08x\n", r->rt, p[0], p[1]); } }
+        clear(r, p, size); break;
+    case DSR_DRAW: draw(r, p, size); break;
+    case DSR_SET_RT: r->rt = p[0]; r->ds = p[1];
+        { static int n = -1; if (n < 0) n = getenv("DSR_RTLOG") ? atoi(getenv("DSR_RTLOG")) : 0;          // development: off-screen targets
+          Surf *t = surf(r, p[0]); if (n > 0 && r->rs[28]) { n--; fprintf(stderr, "dsr: frame %d: render target %u (%ux%u) depth %u, after %ld draws\n", dsr_frame, p[0], t ? t->w : 0, t ? t->h : 0, p[1], dsr_stat[0]); } }
+        break;
+    case DSR_SURFACE_CREATE: surface_create(r, p, size); break;
+    case DSR_SURFACE_DESTROY: if (p[0] < MAXSURF) {   /* a pass drawing with it ends first: its store actions are set and its
+                                                         "drawn since resolved" flag can't outlive it (a new surface in the
+                                                         slot inherited it, and a resolve then loaded memoryless samples: the
+                                                         Metal driver crashed, San Andreas after a failed mission) */
+            if (r->enc && (r->enc_cid == p[0] || r->enc_rt == p[0] || r->enc_ds == p[0] || r->enc_zid == p[0])) end_enc(r);
+            r->s[p[0]].used = 0; r->s[p[0]].ms_dirty = 0; r->s[p[0]].tex = r->s[p[0]].ms = r->s[p[0]].auxz = r->s[p[0]].tex_alt = nil; } break;
+    case DSR_MODE: r->dither16 = size >= 12 && p[2] == 16; break;
+    case DSR_GLOW: if (size >= 8) glow(r, p[0], p[1]); break;   /* a 16-bit screen (the present dithers to 5/6/5) */
+    case DSR_SURFACE_UPLOAD: surface_upload(r, p, size); break;
+    case DSR_UPLOAD_OVER: upload_over(r, p, size); break;
+    case DSR_DEPTH_UPLOAD: if (size >= 12) depth_upload(r, p, size); break;
+    case DSR_READBACK: readback(r, p); break;
+    case DSR_DEPTH_READBACK: if (size >= 24) depth_readback(r, p); break;
+    case DSR_BLT: { int32_t dr[4], sr[4]; memcpy(dr, p + 1, 16); memcpy(sr, p + 6, 16);
+                    { static int lf = -2; if (lf == -2) lf = getenv("DSR_PASSLOG") ? atoi(getenv("DSR_PASSLOG")) : -1;
+                      if (lf >= 0 && dsr_frame == lf) fprintf(stderr, "dsr blt: %u %d,%d-%d,%d <- %u %d,%d-%d,%d flags %x\n", p[0], dr[0], dr[1], dr[2], dr[3], p[5], sr[0], sr[1], sr[2], sr[3], p[10]); }
+                    if (p[5]) quad(r, p[0], dr, p[5], sr, 0, 0); else if (!(p[10] & 0x20000)) quad(r, p[0], dr, 0, dr, 1, p[11]); } break;
+    case DSR_PRESENT: r->presented = p[0]; dsr_frame++;   // caller presents/commits
+        { static int glow = -1; if (glow < 0) glow = getenv("DSR_GLOWLOG") != 0;   // development: effect targets in the corner
+          if (glow) { int x = 0; for (uint32_t id = 1; id < MAXSURF && x < 5 * 260; id++) if (r->s[id].used && r->s[id].fxrt) {
+              int32_t d[4] = {x, 0, x + 256, 256}, sr[4] = {0, 0, 256, 256}; uint32_t ort = r->rt; quad(r, p[0], d, id, sr, 0, 0); r->rt = ort; x += 260; } } }
+        { static int show = -1; if (show < 0) show = getenv("DSR_SHOWSURF") ? atoi(getenv("DSR_SHOWSURF")) : 0;   // development: a surface in the corner
+          Surf *t = surf(r, (uint32_t)show); if (show > 0 && t) { int32_t d[4] = {0, 0, (int32_t)t->w, (int32_t)t->h}, sr[4] = {0, 0, (int32_t)t->w, (int32_t)t->h};
+            uint32_t ort = r->rt; quad(r, p[0], d, (uint32_t)show, sr, 0, 0); r->rt = ort; } }
+        r->present_ts = (size >= 16 && p[3]) ? (((uint64_t)p[2] << 32) | p[1]) / (double)p[3] : -1; return 1;
+    case DSR_PROG_CREATE: prog_create(r, p, size); break;
+    case DSR_PROG_USE: r->cur_prog = p[0] < 1024 ? p[0] : 0; r->cur_mp = p[0] >= 0x10000 && p[0] < 0x10000 + 4096 ? p[0] - 0x10000 + 1 : 0; break;
+    case DSR_MSL_CREATE: msl_create(r, p, size); break;
+    case DSR_SHADER_CONST: shader_const(r, p, size); break;
+    case DSR_PROG_CONST: if (size >= 4 && p[0] <= 4096 && 4 + 16 * (uint64_t)p[0] <= size) { memcpy(r->pconst, p + 1, 16 * (size_t)p[0]); r->npconst = p[0]; } break;
+    case DSR_DRAW_PROG: if (r->cur_mp) draw_mprog(r, p, size); else draw_prog(r, p, size); break;
+    case DSR_GAMMA: if (size >= 1536) { memcpy(r->gamma, p, 1536); r->gamma_dirty = 1; } break;
+    case DSR_MATERIAL: if (size >= 68) { memcpy(r->material, p, 68); r->ff_light = 1; } break;
+    case DSR_LIGHT: if (size >= 112 && p[0] < 32) { r->light[p[0]].on = p[1] != 0; r->light[p[0]].type = p[2]; memcpy(r->light[p[0]].v, p + 3, 100); r->ff_light = 1; } break;
+    default: break;
+    }
+    return 0;
+}
+
+long prof_waits_now(void) { long n = prof_waits; prof_waits = 0; return n; }

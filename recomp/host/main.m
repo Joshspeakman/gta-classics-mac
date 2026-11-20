@@ -1,0 +1,1132 @@
+// The host: the recompiled game as a native macOS app. The game runs on its own thread (recompiled code +
+// Win32 layer); this file provides the window, the Metal renderer consuming the game's D3D7 command stream in-process
+// (src/renderer), and input (mouse/keyboard -> Windows messages and key state, relative mouse like the original).
+//   <app binary> --exe <game exe> --game <game folder> --data <folder for C: and saved files>
+#include <pwd.h>
+#include <sandbox.h>
+#include <spawn.h>
+#import <AppKit/AppKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
+#import <GameController/GameController.h>
+#import <AVFoundation/AVFoundation.h>
+#ifndef DS_BUILD
+#define DS_BUILD "dev"
+#endif
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <mach/mach_time.h>
+#include <mach/mach.h>
+#import "../../src/renderer/renderer.h"
+#include "../../src/dsr/dsr_proto.h"
+#include "../../src/dsr/dsr_shm.h"
+#include "../runtime/win32/w32.h"
+#include "../runtime/edition.h"
+
+int  w32_prepare(const char *exe, const char *game_dir, const char *drive_c, const char *overlay);
+uint32_t w32_run(char *msg, size_t cap);
+void dsr_attach_consumer(DsrShmHeader *h);
+void dsr_mode_size(uint32_t *w, uint32_t *h);
+void w32_post(uint32_t tid, uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp);
+void w32_set_cursor(int x, int y);
+uint32_t w32_window_tid(uint32_t hwnd);
+extern uint8_t w32_keys[256];
+extern int w32_screen_w, w32_screen_h; extern double w32_screen_scale;
+extern void (*w32_host_window_created)(uint32_t, int, int, int, int, uint32_t);
+extern void (*w32_host_window_changed)(uint32_t, int, int, int, int, int);
+extern char dsr_snapshot_path[1024];
+
+static DsrShmHeader *H; static uint8_t *ring;
+static CAMetalLayer *layer; static NSWindow *win; static uint32_t game_hwnd;
+static volatile int game_running = 1;
+static const char *script_tick(uint32_t fno);
+static uint32_t key_scan(int vk);     // a scripted key's scan code (lParam bits 16..24), as a real key event carries
+static int test_mode;                  // DS_TEST=1: ordinary background window, never captures the mouse or takes focus
+
+// ---------------------------------------------------------------- rendering
+/* test mode: frames the display actually showed (a drawable's presentedTime; 0 when it was never shown) */
+static pthread_mutex_t shown_lock = PTHREAD_MUTEX_INITIALIZER; static int shown_n, shown_over; static double shown_last, shown_gap;
+static void shown(double t)
+{
+    if (t <= 0) return;
+    pthread_mutex_lock(&shown_lock);
+    if (shown_last && t - shown_last > shown_gap) shown_gap = t - shown_last;
+    if (shown_last && t - shown_last > 0.025) shown_over++;
+    shown_last = t; shown_n++;
+    pthread_mutex_unlock(&shown_lock);
+}
+/* The refresh rate of the display the window is on, for the frame cap's "display" setting (ddraw.c; Delta Force's
+ * default): the screen's highest rate (ProMotion: 120), the mode's exact one when it says (59.94 and the like). */
+extern double dsr_display_hz;
+static void note_display(NSScreen *s)
+{
+    if (!s) s = NSScreen.mainScreen;
+    double hz = (double)s.maximumFramesPerSecond;
+    CGDisplayModeRef m = CGDisplayCopyDisplayMode([s.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+    if (m) { double r = CGDisplayModeGetRefreshRate(m); if (r > 0 && fabs(r - hz) < 1) hz = r; CGDisplayModeRelease(m); }
+    if (hz > 0 && hz != dsr_display_hz) { dsr_display_hz = hz; fprintf(stderr, "host: display %.2f Hz\n", hz); }
+}
+void w32_crash_init(const char *data_dir, const char *build); void w32_crash_thread(const char *name);
+void w32_crash_heartbeat(int which); const char *w32_crash_last_path(void);
+const char *w32_crash_report(const char *kind, const char *reason, Ctx *c, uint32_t guest_pc);
+static void *render_thread(void *arg)
+{
+    (void)arg; w32_crash_thread("renderer");
+    @autoreleasepool {
+        DSRRenderer *r = dsr_renderer_create(layer.device);
+        dsr_renderer_set_readback(r, (uint8_t *)H + DSR_READBACK_OFFSET, DSR_READBACK_SIZE, &H->readback_done);
+        uint32_t rpos = H->read_pos, frames = 0, spins = 0;
+        __atomic_store_n(&H->host_ready, 1, __ATOMIC_RELEASE);
+        for (;;) {
+            uint32_t wpos = __atomic_load_n(&H->write_pos, __ATOMIC_ACQUIRE);
+            if (rpos == wpos) { if (++spins < 2000) { __asm__ volatile("yield"); continue; } usleep(50); continue; }
+            spins = 0;
+            @autoreleasepool {
+                while (rpos != wpos) {
+                    uint32_t off = rpos % DSR_RING_SIZE;
+                    if (DSR_RING_SIZE - off < 8) { rpos += DSR_RING_SIZE - off; continue; }
+                    uint32_t op = *(uint32_t *)(ring + off), size = *(uint32_t *)(ring + off + 4);
+                    if (op == DSR_WRAP) { rpos += 8 + size; continue; }
+                    int present = dsr_renderer_exec(r, op, ring + off + 8, size);
+                    rpos += 8 + size;
+                    __atomic_store_n(&H->read_pos, rpos, __ATOMIC_RELEASE);
+                    if (!present) continue;
+                    uint32_t w, h; dsr_renderer_presented_size(r, &w, &h);
+                    if (w && h && (layer.drawableSize.width != w || layer.drawableSize.height != h)) {
+                        [CATransaction begin]; [CATransaction setDisableActions:YES]; layer.drawableSize = CGSizeMake(w, h); [CATransaction commit];
+                    }
+                    uint32_t fno = ++frames;
+                    if (test_mode) {   // one line per second: frames presented, the mode, GPU time per frame and frame-time spikes
+                        static double t0, last; double now = CACurrentMediaTime(); static uint32_t f0; static double worst; static int spikes;
+                        if (!t0) t0 = now;
+                        if (last) { double ft = now - last; if (ft > worst) worst = ft; if (ft > 0.025) spikes++; } last = now;
+                        if (now - t0 >= 1.0) {
+                            extern long dsr_stat[8]; extern double dsr_gpu_ms[100000]; extern int dsr_frame;
+                            double gsum = 0, gmax = 0; int gn = 0;   // frames whose command buffers have completed (two behind)
+                            for (int k = (int)f0 - 2; k < dsr_frame - 2; k++) if (k >= 0 && k < 100000) { gsum += dsr_gpu_ms[k]; if (dsr_gpu_ms[k] > gmax) gmax = dsr_gpu_ms[k]; gn++; }
+                            pthread_mutex_lock(&shown_lock); int sn = shown_n, so = shown_over; double sg = shown_gap; shown_n = 0; shown_gap = 0; shown_over = 0; pthread_mutex_unlock(&shown_lock);
+                            extern _Atomic int64_t w32_heap_bytes; struct mach_task_basic_info ti; mach_msg_type_number_t tn = MACH_TASK_BASIC_INFO_COUNT;
+                            double rss = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&ti, &tn) == KERN_SUCCESS ? ti.resident_size / 1048576.0 : 0;
+                            fprintf(stderr, "host: frame %u (%ux%u) %.1f fps; draws %ld, dropped %ld/%ld/%ld/%ld; gpu %.2f ms (max %.2f); longest frame %.1f ms, %d over 25 ms; "
+                                    "on screen %.1f fps, longest %.1f ms, %d over 25 ms; heap %.1f MB, rss %.0f MB\n",
+                                    fno, w, h, (fno - f0) / (now - t0), dsr_stat[0], dsr_stat[1], dsr_stat[2], dsr_stat[3], dsr_stat[4],
+                                    gn ? gsum / gn : 0, gmax, worst * 1000, spikes, sn / (now - t0), sg * 1000, so, w32_heap_bytes / 1048576.0, rss);
+                            t0 = now; f0 = fno; worst = 0; spikes = 0; }
+                    }
+                    {   // DS_SHOT=<path>,<frame>: save that frame as a PNG (development)
+                        static long shot_at = -2; static char shot_path[1024];
+                        if (shot_at == -2) { const char *e = test_mode ? getenv("DS_SHOT") : 0; shot_at = -1;   /* test mode only: it writes anywhere */ if (e) { const char *cm = strrchr(e, ','); if (cm) { snprintf(shot_path, sizeof shot_path, "%.*s", (int)(cm - e), e); shot_at = atol(cm + 1); } } }
+                        const char *sp = test_mode ? script_tick(fno) : 0;
+                        if (sp) { snprintf(shot_path, sizeof shot_path, "%s", sp); shot_at = fno; }
+                        if ((long)fno == shot_at) {
+                            id<MTLTexture> tex = dsr_renderer_presented(r); dsr_renderer_flush(r, 1);
+                            if (tex && getenv("DS_SHOT_FINAL")) {   /* the picture as shown: after gamma and the 16-bit look */
+                                MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:tex.width height:tex.height mipmapped:NO];
+                                od.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; od.storageMode = MTLStorageModePrivate;
+                                id<MTLTexture> fin = [layer.device newTextureWithDescriptor:od];
+                                if (fin && dsr_renderer_present_to(r, fin)) { dsr_renderer_flush(r, 1); tex = fin; }
+                            }
+                            if (tex && tex.pixelFormat == MTLPixelFormatBGRA8Unorm) {
+                                NSUInteger tw = tex.width, th = tex.height;
+                                id<MTLBuffer> buf = [layer.device newBufferWithLength:tw * th * 4 options:MTLResourceStorageModeShared];
+                                id<MTLCommandQueue> q = [layer.device newCommandQueue]; id<MTLCommandBuffer> cbs = [q commandBuffer];
+                                id<MTLBlitCommandEncoder> bl = [cbs blitCommandEncoder];
+                                [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(tw, th, 1)
+                                           toBuffer:buf destinationOffset:0 destinationBytesPerRow:tw * 4 destinationBytesPerImage:tw * th * 4];
+                                [bl endEncoding]; [cbs commit]; [cbs waitUntilCompleted];
+                                uint8_t *px = malloc(tw * th * 4); memcpy(px, buf.contents, tw * th * 4);
+                                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                                CGContextRef cg = CGBitmapContextCreate(px, tw, th, 8, tw * 4, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+                                CGImageRef img = CGBitmapContextCreateImage(cg);
+                                NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:img];
+                                [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:shot_path] atomically:YES];
+                                CGImageRelease(img); CGContextRelease(cg); CGColorSpaceRelease(cs); free(px);
+                                fprintf(stderr, "host: frame %u saved to %s\n", fno, shot_path);
+                            } else if (tex) fprintf(stderr, "host: screenshot: unexpected pixel format %lu\n", (unsigned long)tex.pixelFormat);
+                        }
+                    }
+                    static int bench = -1; if (bench < 0) bench = test_mode && getenv("DS_BENCH") && atoi(getenv("DS_BENCH")) > 0;
+                    if (bench) {   /* development: DS_BENCH=1 shows each frame in a texture of the window's size instead of the
+                                      window, so neither VSync nor the compositor (which slows a background window) paces it */
+                        static id<MTLTexture> bt[3]; static int bi; CGSize sz = layer.drawableSize;
+                        if (!bt[bi] || bt[bi].width != (NSUInteger)sz.width || bt[bi].height != (NSUInteger)sz.height) {
+                            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:(NSUInteger)sz.width height:(NSUInteger)sz.height mipmapped:NO];
+                            td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate; bt[bi] = [layer.device newTextureWithDescriptor:td];
+                        }
+                        id<MTLCommandBuffer> bcb = dsr_renderer_present_to(r, bt[bi]); bi = (bi + 1) % 3;
+                        if (bcb) [bcb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; __atomic_store_n(&H->frames_done, fno, __ATOMIC_RELEASE); }];
+                        dsr_renderer_flush(r, 0); if (!bcb) __atomic_store_n(&H->frames_done, fno, __ATOMIC_RELEASE);
+                        continue;
+                    }
+                    double nd0 = CACurrentMediaTime(); id<CAMetalDrawable> d = [layer nextDrawable];
+                    {   /* none free for long: the compositor isn't taking pictures (the window hidden: another Space in front, the
+                           display asleep, the screen locked) */
+                        double nd = CACurrentMediaTime() - nd0; static double said;
+                        if (nd > 0.25 && nd0 - said > 5) { said = nd0; fprintf(stderr, "host: the window had no picture free for %.0f ms%s\n", nd * 1000, d ? "" : " (none came: the window hidden?)"); } }
+                    id<MTLCommandBuffer> cb = d ? dsr_renderer_present_to(r, d.texture) : nil;
+                    if (cb) {
+                        if (test_mode) [d addPresentedHandler:^(id<MTLDrawable> dr) { shown(dr.presentedTime); }];
+#ifdef GTA_EDITION
+                        /* a game capped below the display's rate: each frame shown at least 1/cap after the last (whole refreshes:
+                           half a refresh less), so frames finished early or late in their interval don't show unevenly */
+                        { int gta_present_cap(void); int cap = gta_present_cap();
+                          if (cap > 0 && dsr_display_hz > cap * 1.2 && layer.displaySyncEnabled) [cb presentDrawable:d afterMinimumDuration:1.0 / cap - 0.5 / dsr_display_hz];
+                          else [cb presentDrawable:d]; }
+#else
+                        [cb presentDrawable:d];
+#endif
+                        w32_crash_heartbeat(3);
+                        [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; __atomic_store_n(&H->frames_done, fno, __ATOMIC_RELEASE); }];
+                        dsr_renderer_flush(r, 0);
+                    } else { dsr_renderer_flush(r, 0); __atomic_store_n(&H->frames_done, fno, __ATOMIC_RELEASE); }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- test scripting (DS_SCRIPT, test mode only)
+// DS_SCRIPT="1900:click:400,150;2100:shot:/tmp/a.png;2200:key:13" : at a presented frame, act through the same message
+// path as real input. Coordinates are in the game's current display mode.
+typedef struct { uint32_t frame; double at; char kind[8]; int x, y; char path[512]; } Act;   // at > 0: seconds from start
+static struct { uint32_t addr; uint8_t v; } holds[64]; static int nholds;
+static volatile int fake_pad_set; static uint32_t fake_pad[1]; static float fake_pad_ax[4];   /* "pad:buttons(hex),lx,ly,rx,ry" */   /* "pin:" (DS_CMDFILE): bytes kept in game memory */
+static Act acts[2048]; static int nacts;
+static double vcur_x, vcur_y;          // virtual cursor in game (display mode) pixels
+static void post(uint32_t msg, uint32_t wp, uint32_t lp);
+static int captured;
+static double raw_fx, raw_fy, cursor_fx, cursor_fy;
+extern void w32_raw_mouse_move(int dx, int dy);
+extern void w32_raw_mouse_sample(int32_t *dx, int32_t *dy, int consume);
+/* DirectInput 8's system mouse and keyboard (runtime/win32/dinput8.c), fed from the same events as the window
+ * messages: San Andreas reads its mouse (menu pointer, camera) only from DirectInput */
+extern void w32_di_key(int dik, int down), w32_di_mouse_move(int dx, int dy), w32_di_mouse_wheel(int dz), w32_di_mouse_button(int b, int down);
+static void di_key_vk(int vk, int down);
+static void capture(int on);
+static void rel_motion(double gx, double gy);   /* relative motion in game pixels, the real-input path */
+static uint32_t pos_lp(void);
+static void parse_script(void)
+{
+    const char *e = getenv("DS_SCRIPT"); if (!e) return;
+    char *s = strdup(e), *save, *tok = strtok_r(s, ";", &save);
+    while (tok && nacts < 2048) {
+        Act *a = &acts[nacts]; char kind[8] = "", rest[600] = "";
+        int ok = tok[0] == '@' ? sscanf(tok + 1, "%lf:%7[a-z]:%599[^\n]", &a->at, kind, rest) : sscanf(tok, "%u:%7[a-z]:%599[^\n]", &a->frame, kind, rest);
+        if (tok[0] == '@') a->frame = 0xffffffffu;
+        if (ok >= 2) {
+            snprintf(a->kind, sizeof a->kind, "%s", kind);
+            if (!strcmp(kind, "shot") || !strcmp(kind, "type") || !strcmp(kind, "peek")) snprintf(a->path, sizeof a->path, "%s", rest); else sscanf(rest, "%d,%d", &a->x, &a->y);
+            nacts++;
+        }
+        tok = strtok_r(0, ";", &save);
+    }
+    free(s);
+}
+/* The game moves its own cursor by the distance of the OS cursor from the window centre each frame (then re-centres
+ * it), so a scripted click is mouse motion: pin to the top-left corner, then move by the target offset in steps. */
+static int mot_dx, mot_dy, mot_home;
+/* Dungeon Siege II reads the cursor's absolute position (GetCursorPos): a scripted move puts it at the target and sends
+ * WM_MOUSEMOVE there for a few frames */
+static void motion_tick(void)
+{
+    if (mot_home <= 0) return;
+    mot_home--;
+#ifdef DF_EDITION
+    { int x = mot_dx, y = mot_dy; extern void w32_client_to_screen(uint32_t, int *, int *); w32_client_to_screen(game_hwnd, &x, &y);   // script points are the game's
+      vcur_x = x; vcur_y = y; w32_set_cursor(x, y); post(0x200, 0, ((uint32_t)y << 16) | ((uint32_t)x & 0xffff)); return; }
+#endif
+    vcur_x = mot_dx; vcur_y = mot_dy; w32_set_cursor(mot_dx, mot_dy);
+    post(0x200, 0, ((uint32_t)mot_dy << 16) | ((uint32_t)mot_dx & 0xffff));
+}
+/* "type" action: each character as a keyDown/keyUp NSEvent sent to the window; {esc} {enter} {bs} for keys */
+static void type_text(NSString *text);
+/* DS_CMDFILE=<path> (test mode): lines appended to the file while the game runs ("click:400,290", "type:Name",
+ * "key:13", "shot:/tmp/a.png", ...) are carried out from the next frame on: for tests driven from outside.
+ * "lag:100,20" sets the DP8_LAG simulator; "peek:7a05fc,a8,13" prints game memory: the dword at the first (hex) address, then each further offset added to the
+ * previous value and read again (a pointer chain) */
+static void cmdfile_poll(uint32_t fno)
+{
+    static const char *path; static off_t pos; static int init;
+    if (!init) { init = 1; path = getenv("DS_CMDFILE"); }
+    if (!path || fno % 15) return;
+    FILE *f = fopen(path, "r"); if (!f) return;
+    fseeko(f, pos, SEEK_SET); char line[700];
+    while (nacts < 2048 && fgets(line, sizeof line, f)) {
+        size_t l = strlen(line); if (!l || line[l - 1] != '\n') break;       /* a line still being written */
+        pos += (off_t)l; line[l - 1] = 0;
+        Act *a = &acts[nacts]; char kind[8] = "", rest[600] = "";
+        if (sscanf(line, "%7[a-z]:%599[^\n]", kind, rest) < 1 || !kind[0]) continue;
+        memset(a, 0, sizeof *a); a->frame = fno + 1; snprintf(a->kind, sizeof a->kind, "%s", kind);
+        if (!strcmp(kind, "shot") || !strcmp(kind, "type") || !strcmp(kind, "peek") || !strcmp(kind, "poke") || !strcmp(kind, "pin") || !strcmp(kind, "unpin") || !strcmp(kind, "tp") || !strcmp(kind, "dump") || !strcmp(kind, "gta") || !strcmp(kind, "pad"))
+            snprintf(a->path, sizeof a->path, "%s", rest); else sscanf(rest, "%d,%d", &a->x, &a->y);
+        nacts++; fprintf(stderr, "host: command %s\n", line);
+    }
+    fclose(f);
+}
+static const char *script_tick(uint32_t fno)       /* returns a screenshot path if one is due */
+{
+    const char *shot = 0;
+    cmdfile_poll(fno);
+    static double t0; double now = CACurrentMediaTime(); if (!t0) t0 = now;
+    for (int k = 0; k < nacts; k++) if (acts[k].at > 0 && acts[k].frame == 0xffffffffu && now - t0 >= acts[k].at) acts[k].frame = fno;   /* timed steps start now */
+    motion_tick();
+    { extern uint8_t *G_MEM; for (int k = 0; k < nholds; k++) G_MEM[holds[k].addr] = holds[k].v; }   /* pin: */
+    for (int k = 0; k < nacts; k++) {
+        Act *a = &acts[k];
+        if (!strcmp(a->kind, "click") || !strcmp(a->kind, "rclick")) {
+            int r = a->kind[0] == 'r';
+            if (fno == a->frame) { mot_home = 8; mot_dx = a->x; mot_dy = a->y; }
+            if (fno == a->frame + 20) { w32_di_mouse_button(r, 1); post(r ? 0x204 : 0x201, r ? 2 : 1, pos_lp()); }
+            if (fno == a->frame + 24) { w32_di_mouse_button(r, 0); post(r ? 0x205 : 0x202, 0, pos_lp()); }
+        } else if (!strcmp(a->kind, "press")) {           /* press:x,y: the left button pressed and held (until a later click) */
+            if (fno == a->frame) { mot_home = 8; mot_dx = a->x; mot_dy = a->y; }
+            if (fno == a->frame + 20) { w32_di_mouse_button(0, 1); post(0x201, 1, pos_lp()); }
+        } else if (!strcmp(a->kind, "move") && fno == a->frame) { mot_home = 8; mot_dx = a->x; mot_dy = a->y; }
+        else if (!strcmp(a->kind, "rel") && fno >= a->frame && fno < a->frame + 60) rel_motion(a->x / 60.0, a->y / 60.0);   /* x,y over 60 frames, like a trackpad swipe */
+        else if (!strcmp(a->kind, "glide") && fno == a->frame) {   /* glide:x,y: the same motion over half a second, 1000 times a second
+                                                                       like a real mouse, whatever the frame rate */
+            int gx = a->x, gy = a->y;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                for (int k = 0; k < 500; k++) { dispatch_async(dispatch_get_main_queue(), ^{ rel_motion(gx / 500.0, gy / 500.0); }); usleep(1000); } });
+        }
+        else if (!strcmp(a->kind, "key")) {
+            if (fno == a->frame) { w32_keys[a->x & 0xff] = 0x80; di_key_vk(a->x, 1); post(0x100, (uint32_t)a->x, 1 | key_scan(a->x)); }
+            if (fno == a->frame + 3) { w32_keys[a->x & 0xff] = 0; di_key_vk(a->x, 0); post(0x101, (uint32_t)a->x, 0xc0000001u | key_scan(a->x)); }
+        } else if (!strcmp(a->kind, "hold")) {            /* hold:vk,frames: a key held down (the modifier of a chord) */
+            if (fno == a->frame) { w32_keys[a->x & 0xff] = 0x80; di_key_vk(a->x, 1); post(0x100, (uint32_t)a->x, 1 | key_scan(a->x)); }
+            if (fno == a->frame + (uint32_t)a->y) { w32_keys[a->x & 0xff] = 0; di_key_vk(a->x, 0); post(0x101, (uint32_t)a->x, 0xc0000001u | key_scan(a->x)); }
+        } else if (!strcmp(a->kind, "shot") && fno == a->frame) shot = a->path;
+        else if (!strcmp(a->kind, "msg") && fno == a->frame) post((uint32_t)a->x, (uint32_t)a->y, 0);   /* msg:<message>,<wparam> to the game's window */
+        else if ((!strcmp(a->kind, "poke") || !strcmp(a->kind, "pin") || !strcmp(a->kind, "unpin")) && fno == a->frame) {
+            /* poke:addr=byte,... writes game memory once; pin: every frame until unpin:addr,... (effect flags the game clears) */
+            char buf[512], *sv, *t; snprintf(buf, sizeof buf, "%s", a->path);
+            for (t = strtok_r(buf, ",", &sv); t; t = strtok_r(0, ",", &sv)) {
+                unsigned ad = 0, v = 0; int n = sscanf(t, "%x=%x", &ad, &v); if (n < 1 || ad < 0x10000u || ad >= 0x40000000u) continue;
+                if (!strcmp(a->kind, "poke")) { extern uint8_t *G_MEM; G_MEM[ad] = (uint8_t)v; }
+                else if (!strcmp(a->kind, "pin")) { int k = 0; while (k < nholds && holds[k].addr != ad) k++; if (k < 64) { holds[k].addr = ad; holds[k].v = (uint8_t)v; if (k == nholds) nholds++; } }
+                else for (int k = 0; k < nholds; k++) if (holds[k].addr == ad) holds[k] = holds[--nholds];
+            }
+            fprintf(stderr, "host: %s %s\n", a->kind, a->path);
+        }
+        else if (!strcmp(a->kind, "pad") && fno == a->frame) {   /* pad:buttons(hex),lx,ly,rx,ry: the test controller from now on */
+            unsigned bb = 0; float v[4] = {0, 0, 0, 0}; sscanf(a->path, "%x,%f,%f,%f,%f", &bb, &v[0], &v[1], &v[2], &v[3]);
+            fake_pad[0] = bb; memcpy(fake_pad_ax, v, sizeof v); fake_pad_set = 1;
+        }
+#ifdef GTA_EDITION
+        else if (!strcmp(a->kind, "gta") && fno == a->frame) { extern void gta_dev_command(const char *); gta_dev_command(a->path); }   /* gta:verb,args (gta3_mode.c) */
+        else if (!strcmp(a->kind, "tp") && fno == a->frame) {   /* tp:x,y,z (the GTA games): the player there (gta3_mode.c) */
+            float x, y, z; if (sscanf(a->path, "%f,%f,%f", &x, &y, &z) == 3) { extern void gta_request_teleport(float, float, float); gta_request_teleport(x, y, z); }
+        }
+#endif
+        else if (!strcmp(a->kind, "dump") && fno == a->frame) {   /* dump:addr,len,file: game memory into a file (finding variables) */
+            unsigned ad = 0, n = 0; char fp[400] = ""; extern uint8_t *G_MEM;
+            if (sscanf(a->path, "%x,%x,%399s", &ad, &n, fp) == 3 && ad >= 0x10000u && n <= 0x1000000u && ad + n < 0x40000000u) {
+                FILE *o = fopen(fp, "wb"); if (o) { fwrite(G_MEM + ad, 1, n, o); fclose(o); } }
+        }
+        else if (!strcmp(a->kind, "peek") && fno == a->frame) {
+            extern uint8_t *G_MEM; char *e = a->path; uint32_t at = (uint32_t)strtoul(e, &e, 16), v = 0;
+            for (;;) { if (at < 0x10000u) { v = 0; break; } memcpy(&v, G_MEM + at, 4); if (*e != ',') break; at = v + (uint32_t)strtoul(e + 1, &e, 16); }
+            fprintf(stderr, "host: peek %s = 0x%08x (byte 0x%02x)\n", a->path, v, v & 0xff);
+        }
+        else if (!strcmp(a->kind, "wheel") && fno >= a->frame && fno < a->frame + (uint32_t)abs(a->x)) w32_di_mouse_wheel(a->x > 0 ? 120 : -120), post(0x20a, ((uint32_t)(int16_t)(a->x > 0 ? 120 : -120) << 16), pos_lp());   /* x notches */
+        else if (!strcmp(a->kind, "type") && fno == a->frame) {   /* real NSEvents through the window (keyboard path) */
+            NSString *text = @(a->path);
+            dispatch_async(dispatch_get_main_queue(), ^{ type_text(text); });
+        }
+    }
+    return shot;
+}
+
+// ---------------------------------------------------------------- input
+typedef struct { uint8_t vk, scan, ext; } Key;
+static Key keymap[128];
+static void init_keymap(void)
+{
+    static const uint8_t t[][4] = {   // macOS keycode, VK, scan, extended
+        {0x00,'A',0x1e,0},{0x01,'S',0x1f,0},{0x02,'D',0x20,0},{0x03,'F',0x21,0},{0x04,'H',0x23,0},{0x05,'G',0x22,0},{0x06,'Z',0x2c,0},
+        {0x07,'X',0x2d,0},{0x08,'C',0x2e,0},{0x09,'V',0x2f,0},{0x0b,'B',0x30,0},{0x0c,'Q',0x10,0},{0x0d,'W',0x11,0},{0x0e,'E',0x12,0},
+        {0x0f,'R',0x13,0},{0x10,'Y',0x15,0},{0x11,'T',0x14,0},{0x12,'1',0x02,0},{0x13,'2',0x03,0},{0x14,'3',0x04,0},{0x15,'4',0x05,0},
+        {0x16,'6',0x07,0},{0x17,'5',0x06,0},{0x18,0xbb,0x0d,0},{0x19,'9',0x0a,0},{0x1a,'7',0x08,0},{0x1b,0xbd,0x0c,0},{0x1c,'8',0x09,0},
+        {0x1d,'0',0x0b,0},{0x1e,0xdd,0x1b,0},{0x1f,'O',0x18,0},{0x20,'U',0x16,0},{0x21,0xdb,0x1a,0},{0x22,'I',0x17,0},{0x23,'P',0x19,0},
+        {0x24,0x0d,0x1c,0},{0x25,'L',0x26,0},{0x26,'J',0x24,0},{0x27,0xde,0x28,0},{0x28,'K',0x25,0},{0x29,0xba,0x27,0},{0x2a,0xdc,0x2b,0},
+        {0x2b,0xbc,0x33,0},{0x2c,0xbf,0x35,0},{0x2d,'N',0x31,0},{0x2e,'M',0x32,0},{0x2f,0xbe,0x34,0},{0x30,0x09,0x0f,0},{0x31,0x20,0x39,0},
+        {0x32,0xc0,0x29,0},{0x33,0x08,0x0e,0},{0x35,0x1b,0x01,0},{0x38,0x10,0x2a,0},{0x39,0x14,0x3a,0},{0x3a,0x12,0x38,0},{0x3b,0x11,0x1d,0},
+        {0x3c,0x10,0x36,0},{0x3d,0x12,0x38,1},{0x3e,0x11,0x1d,1},{0x7a,0x70,0x3b,0},{0x78,0x71,0x3c,0},{0x63,0x72,0x3d,0},{0x76,0x73,0x3e,0},
+        {0x60,0x74,0x3f,0},{0x61,0x75,0x40,0},{0x62,0x76,0x41,0},{0x64,0x77,0x42,0},{0x65,0x78,0x43,0},{0x6d,0x79,0x44,0},{0x67,0x7a,0x57,0},
+        {0x6f,0x7b,0x58,0},{0x73,0x24,0x47,1},{0x74,0x21,0x49,1},{0x75,0x2e,0x53,1},{0x77,0x23,0x4f,1},{0x79,0x22,0x51,1},{0x7b,0x25,0x4b,1},
+        {0x7c,0x27,0x4d,1},{0x7d,0x28,0x50,1},{0x7e,0x26,0x48,1},{0x52,0x60,0x52,0},{0x53,0x61,0x4f,0},{0x54,0x62,0x50,0},{0x55,0x63,0x51,0},
+        {0x56,0x64,0x4b,0},{0x57,0x65,0x4c,0},{0x58,0x66,0x4d,0},{0x59,0x67,0x47,0},{0x5b,0x68,0x48,0},{0x5c,0x69,0x49,0},{0x41,0x6e,0x53,0},
+        {0x43,0x6a,0x37,0},{0x45,0x6b,0x4e,0},{0x4e,0x6d,0x4a,0},{0x4b,0x6f,0x35,1},{0x4c,0x0d,0x1c,1}};
+    for (size_t k = 0; k < sizeof t / sizeof *t; k++) { keymap[t[k][0]].vk = t[k][1]; keymap[t[k][0]].scan = t[k][2]; keymap[t[k][0]].ext = t[k][3]; }
+}
+static uint32_t key_scan(int vk)
+{
+    for (int k = 0; k < 128; k++) if (keymap[k].vk == vk) return (uint32_t)keymap[k].scan << 16 | (uint32_t)keymap[k].ext << 24;
+    return 0;
+}
+static void di_key_vk(int vk, int down)                 /* DIK codes are the scan codes, extended keys with bit 7 */
+{
+    for (int k = 0; k < 128; k++) if (keymap[k].vk == vk) { w32_di_key(keymap[k].scan | (keymap[k].ext ? 0x80 : 0), down); return; }
+}
+static uint32_t buttons;               // MK_ flags
+static void post(uint32_t msg, uint32_t wp, uint32_t lp) { if (game_hwnd) w32_post(w32_window_tid(game_hwnd), game_hwnd, msg, wp, lp); }
+static uint32_t mk(void)
+{
+    NSEventModifierFlags f = NSEvent.modifierFlags;
+    return buttons | ((f & NSEventModifierFlagShift) ? 4 : 0) | ((f & NSEventModifierFlagControl) ? 8 : 0);
+}
+void w32_move_cursor(int dx, int dy, int w, int h, int *ox, int *oy); void w32_get_cursor(int *x, int *y);
+static uint32_t pos_lp(void) { int x, y; w32_get_cursor(&x, &y); return ((uint32_t)y << 16) | ((uint32_t)x & 0xffff); }
+static void key_event(uint16_t code, int down, int repeat)
+{
+    if (code >= 128 || !keymap[code].vk) return;
+    Key k = keymap[code]; int alt = (NSEvent.modifierFlags & NSEventModifierFlagOption) != 0;
+    uint32_t prev = (w32_keys[k.vk] & 0x80) ? 1 : 0;
+    w32_keys[k.vk] = down ? (uint8_t)(0x80 | ((w32_keys[k.vk] & 1) ^ (repeat ? 0 : 1))) : (uint8_t)(w32_keys[k.vk] & 1);
+    if (k.vk == 0x10) w32_keys[code == 0x3c ? 0xa1 : 0xa0] = w32_keys[0x10];
+    if (k.vk == 0x11) w32_keys[k.ext ? 0xa3 : 0xa2] = w32_keys[0x11];
+    if (k.vk == 0x12) w32_keys[k.ext ? 0xa5 : 0xa4] = w32_keys[0x12];
+    uint32_t lp = 1u | ((uint32_t)k.scan << 16) | ((uint32_t)k.ext << 24) | (prev << 30) | (down ? 0 : 0x80000000u);
+    int sys = alt || k.vk == 0x12;
+    if (!repeat) w32_di_key(k.scan | (k.ext ? 0x80 : 0), down);
+    post(down ? (sys ? 0x104u : 0x100u) : (sys ? 0x105u : 0x101u), k.vk, lp);
+}
+
+/* A borderless window cannot become the key window by default, so it would get no keyboard events (only the mouse,
+ * which goes to the window under the pointer). */
+/* The launch window's display choices (host/gta3_launcher.m): DS_DISPLAY=window, DS_NOTCH=around (else below it). */
+static NSView *game_view;   /* the picture: the window's content, or under the notch's band */
+static int windowed(void) { const char *e = getenv("DS_DISPLAY"); return e && !strcmp(e, "window"); }
+/* The panel's own pixels: a scaled display mode (a MacBook Pro's "More Space", 2056 x 1329 points = 4112 x 2658 pixels)
+ * draws more pixels than the panel has (3456 x 2234) and macOS scales them down. The mode that shows the panel's pixels
+ * one to one at twice its points (macOS's default for the display), if it isn't the current one; *pw, *ph its pixels. */
+static CGDisplayModeRef native_panel_mode(CGDirectDisplayID d, size_t *pw, size_t *ph)
+{
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)@{(__bridge id)kCGDisplayShowDuplicateLowResolutionModes: @YES});
+    if (!modes) return NULL;
+    size_t nw = 0, nh = 0; CFIndex n = CFArrayGetCount(modes);
+    for (CFIndex i = 0; i < n; i++) { CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if ((CGDisplayModeGetIOFlags(m) & 0x02000000) && CGDisplayModeGetPixelWidth(m) > nw) { nw = CGDisplayModeGetPixelWidth(m); nh = CGDisplayModeGetPixelHeight(m); } }   /* kDisplayModeNativeFlag */
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(d), best = NULL; double cr = cur ? CGDisplayModeGetRefreshRate(cur) : 0;
+    for (CFIndex i = 0; nw && i < n; i++) { CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        if (CGDisplayModeGetPixelWidth(m) != nw || CGDisplayModeGetPixelHeight(m) != nh || CGDisplayModeGetWidth(m) * 2 != nw || !CGDisplayModeIsUsableForDesktopGUI(m)) continue;
+        if (!best || fabs(CGDisplayModeGetRefreshRate(m) - cr) < fabs(CGDisplayModeGetRefreshRate(best) - cr)) best = m; }
+    if (best && cur && CGDisplayModeGetPixelWidth(cur) == nw && CGDisplayModeGetPixelHeight(cur) == nh) best = NULL;   /* already one to one */
+    if (best) { CGDisplayModeRetain(best); if (pw) *pw = nw; if (ph) *ph = nh; }
+    if (cur) CGDisplayModeRelease(cur); CFRelease(modes);
+    return best;
+}
+/* The launcher's Resolution: Native: the main display in that mode while the game runs. For this app only
+ * (kCGConfigureForAppOnly): macOS puts the desktop's mode back when the game quits, however it ends. */
+static void native_panel(void)
+{
+    CGDirectDisplayID d = CGMainDisplayID(); size_t pw = 0, ph = 0; CGDisplayModeRef m = native_panel_mode(d, &pw, &ph);
+    if (!m) { fprintf(stderr, "host: Native: the display already shows its own pixels\n"); return; }
+    CGDisplayConfigRef cfg;
+    if (CGBeginDisplayConfiguration(&cfg) == kCGErrorSuccess) {
+        CGConfigureDisplayWithDisplayMode(cfg, d, m, NULL);
+        CGError e = CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly);
+        fprintf(stderr, "host: Native: the display in its %zux%zu mode for the game%s\n", pw, ph, e ? " (refused)" : "");
+        if (!e) for (int k = 0; k < 40 && (size_t)lround(NSScreen.mainScreen.frame.size.width * NSScreen.mainScreen.backingScaleFactor) != pw; k++)
+            [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];   /* NSScreen catches up */
+    }
+    CGDisplayModeRelease(m);
+}
+static int notch_around(void) { const char *e = getenv("DS_NOTCH"); return e && !strcmp(e, "around"); }
+@interface GameWindow : NSWindow @end
+@implementation GameWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+/* around the notch: AppKit would move a window over the menu bar's band back down below it; full screen windows keep
+ * the frame they are given */
+- (NSRect)constrainFrameRect:(NSRect)r toScreen:(NSScreen *)s { return windowed() ? [super constrainFrameRect:r toScreen:s] : r; }
+@end
+@interface GameView : NSView @end
+@implementation GameView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (CALayer *)makeBackingLayer { return layer; }
+- (void)moved:(NSEvent *)e
+{
+    /* Relative motion, applied to the game's cursor: the game reads it every frame, moves its own pointer by the
+     * distance from the window centre and re-centres it (SetCursorPos). One scale for both axes: the picture is
+     * shown aspect-correct (the 800x600 menus with bars at the sides). */
+    rel_motion(e.deltaX, e.deltaY);
+}
+- (void)mouseMoved:(NSEvent *)e { [self moved:e]; }
+@end
+static void rel_motion(double gx, double gy)
+{
+    /* Scripted motion originates on the render thread. Serialize it with real
+     * Cocoa events and capture resets before accessing the window or fractions. */
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ rel_motion(gx, gy); });
+        return;
+    }
+    if (!test_mode && !captured) return;
+    if (!isfinite(gx) || !isfinite(gy)) return;
+    /* Keep look sensitivity independent of the window and render resolution.
+     * Cocoa supplies host deltas; only the menu cursor is scaled to game pixels. */
+    raw_fx += gx; raw_fy += gy;
+    int rx = (int)fmax(-2147483647.0, fmin(2147483647.0, raw_fx));
+    int ry = (int)fmax(-2147483647.0, fmin(2147483647.0, raw_fy));
+    raw_fx -= rx; raw_fy -= ry;
+    w32_raw_mouse_move(rx, ry);
+    if (rx || ry) w32_di_mouse_move(rx, ry);
+    uint32_t mw, mh; dsr_mode_size(&mw, &mh);
+    NSSize size = (game_view ?: win.contentView).bounds.size;
+    double scale = fmax(mw / fmax(size.width, 1), mh / fmax(size.height, 1));
+    cursor_fx += gx * scale; cursor_fy += gy * scale;
+    int dx = (int)fmax(-1048576.0, fmin(1048576.0, cursor_fx));
+    int dy = (int)fmax(-1048576.0, fmin(1048576.0, cursor_fy));
+    cursor_fx -= dx; cursor_fy -= dy;
+    if (!dx && !dy) return;
+    int x, y; w32_move_cursor(dx, dy, (int)mw, (int)mh, &x, &y); vcur_x = x; vcur_y = y;
+    post(0x200, mk(), pos_lp());
+}
+@implementation GameView (Drag)
+- (void)mouseDragged:(NSEvent *)e { [self moved:e]; }
+- (void)rightMouseDragged:(NSEvent *)e { [self moved:e]; }
+- (void)otherMouseDragged:(NSEvent *)e { [self moved:e]; }
+- (void)mouseDown:(NSEvent *)e { w32_di_mouse_button(0, 1); buttons |= 1; w32_keys[1] = 0x80; post(e.clickCount == 2 ? 0x203 : 0x201, mk(), pos_lp()); }
+- (void)mouseUp:(NSEvent *)e { w32_di_mouse_button(0, 0); buttons &= ~1u; w32_keys[1] = 0; post(0x202, mk(), pos_lp()); }
+- (void)rightMouseDown:(NSEvent *)e { w32_di_mouse_button(1, 1); buttons |= 2; w32_keys[2] = 0x80; post(e.clickCount == 2 ? 0x206 : 0x204, mk(), pos_lp()); }
+- (void)rightMouseUp:(NSEvent *)e { w32_di_mouse_button(1, 0); buttons &= ~2u; w32_keys[2] = 0; post(0x205, mk(), pos_lp()); }
+- (void)otherMouseDown:(NSEvent *)e { w32_di_mouse_button(2, 1); buttons |= 0x10; w32_keys[4] = 0x80; post(0x207, mk(), pos_lp()); }
+- (void)otherMouseUp:(NSEvent *)e { w32_di_mouse_button(2, 0); buttons &= ~0x10u; w32_keys[4] = 0; post(0x208, mk(), pos_lp()); }
+- (void)scrollWheel:(NSEvent *)e
+{
+    static double acc; acc += e.hasPreciseScrollingDeltas ? e.scrollingDeltaY / 10.0 : e.scrollingDeltaY;
+#ifdef DF_EDITION
+    /* the launch window's Modern controls (DF_WHEEL_CYCLE=1): a notch of the wheel cycles weapons, as the game's Backspace
+     * (its key maps know mouse buttons only); a press, released a moment later, at most one every 120 ms */
+    static int cycle = -1; static double last;
+    if (cycle < 0) { const char *c = getenv("DF_WHEEL_CYCLE"); cycle = c && atoi(c); }
+    if (cycle) {
+        if (acc < 1 && acc > -1) return;
+        acc = 0; double now = CACurrentMediaTime(); if (now - last < 0.12) return; last = now;
+        key_event(0x33, 1, 0);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ key_event(0x33, 0, 0); });
+        return;
+    }
+#endif
+    while (acc >= 1 || acc <= -1) { int d = acc > 0 ? 1 : -1; acc -= d; w32_di_mouse_wheel(120 * d); post(0x20a, ((uint32_t)(int16_t)(120 * d) << 16) | mk(), pos_lp()); }
+}
+- (void)keyDown:(NSEvent *)e
+{
+    if (e.modifierFlags & NSEventModifierFlagCommand) { [super keyDown:e]; return; }
+    if (e.keyCode == 0x6f) { if (!e.ARepeat) capture(!captured); return; } /* F12 */
+    key_event(e.keyCode, 1, e.ARepeat);
+    NSString *s = e.characters;
+    for (NSUInteger k = 0; k < s.length; k++) {
+        unichar ch = [s characterAtIndex:k]; uint8_t b; uint16_t w = ch;
+        if (ch >= 0xf700) continue;                                   // function keys
+        if (w32_wide_to_mb(1252, &w, 1, &b, 1) == 1) post(0x102, b, 1);
+    }
+}
+- (void)keyUp:(NSEvent *)e { if (e.keyCode != 0x6f) key_event(e.keyCode, 0, 0); }
+- (void)flagsChanged:(NSEvent *)e
+{
+    static const struct { uint16_t code; NSEventModifierFlags flag; } mods[] = {
+        {0x38, NSEventModifierFlagShift}, {0x3c, NSEventModifierFlagShift}, {0x3b, NSEventModifierFlagControl}, {0x3e, NSEventModifierFlagControl},
+        {0x3a, NSEventModifierFlagOption}, {0x3d, NSEventModifierFlagOption}, {0x39, NSEventModifierFlagCapsLock}};
+    for (size_t k = 0; k < sizeof mods / sizeof *mods; k++) if (mods[k].code == e.keyCode)
+        key_event(e.keyCode, (e.modifierFlags & mods[k].flag) != 0, 0);
+}
+@end
+
+#ifdef DF_EDITION
+// ---------------------------------------------------------------- game controller (df_pad.h)
+static void pad_key(int vk, int down)                   /* through the keyboard's own path, as the key with that VK */
+{
+    for (uint16_t k = 0; k < 128; k++) if (keymap[k].vk == vk) { key_event(k, down, 0); return; }
+}
+static void pad_motion(double dx, double dy) { rel_motion(dx, dy); }
+static void pad_click(int down)
+{
+    if (down) { buttons |= 1; w32_keys[1] = 0x80; post(0x201, mk(), pos_lp()); }
+    else { buttons &= ~1u; w32_keys[1] = 0; post(0x202, mk(), pos_lp()); }
+}
+#include "df_pad.h"
+/* the controller read 250 times a second on the main thread (where the keyboard and mouse come in too): the one in use
+ * last (GCController.current), only while the game is the active app */
+static void pad_start(void)
+{
+    static dispatch_source_t t; static double last;
+    if (t) return;
+    t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t, DISPATCH_TIME_NOW, 4 * NSEC_PER_MSEC, NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{
+        double now = CACurrentMediaTime(), dt = last ? now - last : 0; last = now;
+        PadState s = {0};
+        GCExtendedGamepad *g = (GCController.current ?: GCController.controllers.firstObject).extendedGamepad;
+        if (g && NSApp.active) {
+            s.lx = g.leftThumbstick.xAxis.value; s.ly = g.leftThumbstick.yAxis.value;
+            s.rx = g.rightThumbstick.xAxis.value; s.ry = g.rightThumbstick.yAxis.value;
+            s.lt = g.leftTrigger.value; s.rt = g.rightTrigger.value;
+            const struct { GCControllerButtonInput *in; uint32_t b; } m[] = {
+                {g.buttonA, PB_A}, {g.buttonB, PB_B}, {g.buttonX, PB_X}, {g.buttonY, PB_Y}, {g.leftShoulder, PB_LB}, {g.rightShoulder, PB_RB},
+                {g.buttonOptions, PB_VIEW}, {g.buttonMenu, PB_MENU}, {g.leftThumbstickButton, PB_L3}, {g.rightThumbstickButton, PB_R3},
+                {g.dpad.up, PB_UP}, {g.dpad.down, PB_DOWN}, {g.dpad.left, PB_LEFT}, {g.dpad.right, PB_RIGHT}};
+            for (size_t k = 0; k < sizeof m / sizeof *m; k++) if (m[k].in.pressed) s.b |= m[k].b;
+        }
+        pad_tick(&s, dt);
+    });
+    dispatch_resume(t);
+}
+#endif
+
+#ifdef GTA_EDITION
+// ---------------------------------------------------------------- movies (the GTA games' intro movies, MPEG-1)
+/* The games play Logo.mpg and GTAtitles.mpg through DirectShow (runtime/win32/dshow.c), whose video renderer drew into
+ * the game's window. Here AVFoundation plays the file in a layer over the game's picture (aspect-fit on black); the
+ * runtime is told when it ends (done(user), on the main thread) and stops it when the game skips it. Muted with
+ * W32_AUDIO_MUTE. Found by the runtime with dlsym. */
+typedef void (*gta_movie_done_fn)(void *);
+static AVPlayer *movie_player; static AVPlayerLayer *movie_layer; static id movie_end_obs, movie_fail_obs; static int movie_gen;
+static NSWindow *movie_win;   /* GTA III and San Andreas show their intros before they make their window: one of its own */
+static gta_movie_done_fn movie_done_cb; static void *movie_done_user; static dispatch_source_t movie_pad_timer;
+static void movie_remove(void);
+static void movie_skip(void)   /* a key, click or pad button in the intros' own window: this movie is over */
+{
+    if (!movie_player) return;
+    movie_gen++; movie_remove(); if (movie_done_cb) movie_done_cb(movie_done_user);
+}
+@interface MovieView : NSView @end
+@implementation MovieView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (void)keyDown:(NSEvent *)e { (void)e; movie_skip(); }
+- (void)mouseDown:(NSEvent *)e { (void)e; movie_skip(); }
+@end
+static double win_aspect(void);
+static CALayer *movie_host_layer(void)
+{
+    if (game_view || win) return (game_view ?: win.contentView).layer;
+    if (!movie_win) {
+        NSRect f = NSScreen.mainScreen.frame; NSWindowStyleMask sm = NSWindowStyleMaskBorderless;
+        int background = test_mode && !getenv("DS_DISPLAY");
+        if (background) { f = NSMakeRect(80, 80, 960, 620); sm = NSWindowStyleMaskTitled | NSWindowStyleMaskMiniaturizable; }
+        else if (windowed()) {
+            NSRect vf = NSScreen.mainScreen.visibleFrame; CGFloat h = floor(vf.size.height * 0.78), w = floor(h * win_aspect());
+            f = NSMakeRect(NSMidX(vf) - w / 2, NSMidY(vf) - h / 2, w, h); sm = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
+        }
+        movie_win = [[NSWindow alloc] initWithContentRect:f styleMask:sm backing:NSBackingStoreBuffered defer:NO];
+        movie_win.releasedWhenClosed = NO; movie_win.backgroundColor = NSColor.blackColor; movie_win.title = @DS2_TITLE;
+        movie_win.contentView = [[MovieView alloc] initWithFrame:NSMakeRect(0, 0, f.size.width, f.size.height)];
+        movie_win.contentView.wantsLayer = YES; movie_win.contentView.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+        [movie_win makeFirstResponder:movie_win.contentView];
+        movie_pad_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());   /* a pad button skips too */
+        dispatch_source_set_timer(movie_pad_timer, DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(movie_pad_timer, ^{
+            static int was; GCExtendedGamepad *g = (GCController.current ?: GCController.controllers.firstObject).extendedGamepad;
+            int now = g && (g.buttonA.pressed || g.buttonB.pressed || g.buttonX.pressed || g.buttonY.pressed || g.buttonMenu.pressed);
+            if (now && !was) movie_skip();
+            was = now;
+        });
+        dispatch_resume(movie_pad_timer);
+        if (background) [movie_win orderBack:nil];
+        else {
+            if (!windowed()) [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
+            [movie_win makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; [NSCursor hide];
+        }
+    }
+    return movie_win.contentView.layer;
+}
+static void movie_remove(void)
+{
+    if (movie_end_obs) { [[NSNotificationCenter defaultCenter] removeObserver:movie_end_obs]; movie_end_obs = nil; }
+    if (movie_fail_obs) { [[NSNotificationCenter defaultCenter] removeObserver:movie_fail_obs]; movie_fail_obs = nil; }
+    [movie_player pause]; [movie_layer removeFromSuperlayer]; movie_player = nil; movie_layer = nil;
+}
+__attribute__((visibility("default"), used)) int gta_movie_play(const char *path, gta_movie_done_fn done, void *user)
+{
+    NSString *p = [NSString stringWithUTF8String:path];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:p]) return 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        movie_remove(); int gen = ++movie_gen;
+        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:p]];
+        movie_player = [AVPlayer playerWithPlayerItem:item];
+        { const char *m = getenv("W32_AUDIO_MUTE"); movie_player.muted = m && strcmp(m, "0"); }
+        movie_layer = [AVPlayerLayer playerLayerWithPlayer:movie_player];
+        movie_layer.videoGravity = AVLayerVideoGravityResizeAspect; movie_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+        CALayer *host = movie_host_layer();
+        movie_layer.frame = host.bounds; movie_layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable; movie_layer.zPosition = 10;
+        [host addSublayer:movie_layer];
+        movie_done_cb = done; movie_done_user = user;
+        void (^finish)(NSNotification *) = ^(NSNotification *n) { (void)n; if (gen != movie_gen) return; movie_remove(); if (done) done(user); };
+        movie_end_obs = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification object:item queue:[NSOperationQueue mainQueue] usingBlock:finish];
+        movie_fail_obs = [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemFailedToPlayToEndTimeNotification object:item queue:[NSOperationQueue mainQueue] usingBlock:finish];
+        [movie_player play];
+        fprintf(stderr, "host: movie %s\n", p.UTF8String);
+        if (test_mode) {   /* DS_MOVIE_SKIP="s1,s2,...": skip the nth movie that many seconds in, as a key press would (QA) */
+            static int nth; const char *e = getenv("DS_MOVIE_SKIP"); int idx = nth++; double at = -1;
+            for (int k = 0; e && *e; k++) { char *end; double v = strtod(e, &end); if (end == e) break; if (k == idx) { at = v; break; } e = *end == ',' ? end + 1 : end; if (*end != ',') break; }
+            if (at >= 0) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(at * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (gen == movie_gen && movie_player) { fprintf(stderr, "host: movie skipped %.1f s in (DS_MOVIE_SKIP)\n", at); movie_skip(); } });
+        }
+    });
+    return 1;
+}
+__attribute__((visibility("default"), used)) void gta_movie_stop(void)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{ movie_gen++; movie_remove(); });
+}
+__attribute__((visibility("default"), used)) void gta_movie_close(void)   /* the intros are over: their window goes */
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        movie_gen++; movie_remove();
+        if (movie_pad_timer) { dispatch_source_cancel(movie_pad_timer); movie_pad_timer = nil; }
+        if (movie_win) { [movie_win orderOut:nil]; movie_win = nil; [NSCursor unhide]; }
+    });
+}
+
+// ---------------------------------------------------------------- game controller (the GTA games: DirectInput's gamepad)
+/* The controller (the one used last) as DirectInput's gamepad (runtime/win32/dinput8.c), read 250 times a second on the
+ * main thread while the game is the active app. Buttons in the order the games' default joypad layout expects, so a
+ * modern controller plays like the PS2 (GTA III's generic table, InitDefaultControlConfigJoyPad: 1 fire, 2 sprint /
+ * accelerate, 3 jump / brake, 4 enter / exit, 5-8 L2 R2 L1 R1, 9 camera, 10 horn, 11 look behind, 13-16 the D-pad):
+ * B A X Y, then LT RT LB RB, View, L3, R3, D-pad up right down left. Menu is Esc (the pause menu, which the PC versions
+ * can't put on a pad button). Axes: the left stick, and the right stick as both Z/Rz and Rx/Ry; the triggers are buttons
+ * only (an axis would rest at one end, read as a stick held over). */
+void w32_di_pad(int connected, const float ax[6], uint32_t buttons, int pov);
+static void gta_pad_key(int vk, int down) { for (uint16_t k = 0; k < 128; k++) if (keymap[k].vk == vk) { key_event(k, down, 0); return; } }
+static void gta_pad_start(void)
+{
+    static dispatch_source_t t; if (t) return;
+    t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(t, DISPATCH_TIME_NOW, 4 * NSEC_PER_MSEC, NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{
+        static int menu_was;
+        GCController *gc = GCController.current ?: GCController.controllers.firstObject; GCExtendedGamepad *g = gc.extendedGamepad;
+        float ax[6] = {0, 0, 0, 0, 0, 0}; uint32_t b = 0; int pov = -1, menu = 0;
+        if (g && NSApp.active) {
+            ax[0] = g.leftThumbstick.xAxis.value; ax[1] = -g.leftThumbstick.yAxis.value;
+            ax[2] = ax[3] = g.rightThumbstick.xAxis.value; ax[5] = ax[4] = -g.rightThumbstick.yAxis.value;   /* the right stick as Z/Rz and Rx/Ry
+                                                                                                                (games read one pair or the other) */
+            GCControllerButtonInput *in[11] = {g.buttonB, g.buttonA, g.buttonX, g.buttonY, g.leftTrigger, g.rightTrigger, g.leftShoulder, g.rightShoulder,
+                                               g.buttonOptions, g.leftThumbstickButton, g.rightThumbstickButton};
+            for (int k = 0; k < 11; k++) if (in[k].pressed) b |= 1u << k;
+            if (g.dpad.up.pressed) b |= 1u << 12; if (g.dpad.right.pressed) b |= 1u << 13;
+            if (g.dpad.down.pressed) b |= 1u << 14; if (g.dpad.left.pressed) b |= 1u << 15;
+            menu = g.buttonMenu.pressed;
+        }
+        int connected = g != nil;
+        if (test_mode && getenv("GTA_FAKE_PAD")) {   /* development: GTA_FAKE_PAD="frame:buttons(hex):lx:ly[:rx:ry];..." a pad from the start, its state by presented frame */
+            extern int dsr_frame; double now = dsr_frame;
+            static double t0; if (!t0) t0 = CACurrentMediaTime(); double secs = CACurrentMediaTime() - t0;   /* "@seconds" steps: by time */
+            connected = 1; memset(ax, 0, sizeof ax); b = 0;
+            char *e = strdup(getenv("GTA_FAKE_PAD")), *save, *tok = strtok_r(e, ";", &save);
+            while (tok) { double at; unsigned bb; float lx, ly, rx = 0, ry = 0; int n = sscanf(tok + (tok[0] == '@'), "%lf:%x:%f:%f:%f:%f", &at, &bb, &lx, &ly, &rx, &ry);   /* (+ :rx:ry) */
+                          if (n >= 4 && (tok[0] == '@' ? secs >= at : now >= at)) { b = bb; ax[0] = lx; ax[1] = ly; ax[2] = ax[3] = rx; ax[5] = ax[4] = ry; } tok = strtok_r(0, ";", &save); }
+            free(e);
+        }
+        if (test_mode && fake_pad_set) { connected = 1; memset(ax, 0, sizeof ax); b = fake_pad[0];   /* "pad:" (DS_CMDFILE) */
+                                         ax[0] = fake_pad_ax[0]; ax[1] = fake_pad_ax[1]; ax[2] = ax[3] = fake_pad_ax[2]; ax[5] = ax[4] = fake_pad_ax[3]; }
+        w32_di_pad(connected, ax, b, pov);
+        if (menu != menu_was) { gta_pad_key(0x1b, menu); menu_was = menu; }
+    });
+    dispatch_resume(t);
+}
+#endif
+
+// ---------------------------------------------------------------- window + capture
+static void capture(int on)
+{
+    if (on == captured) return;
+    captured = on;
+    raw_fx = raw_fy = cursor_fx = cursor_fy = 0;
+    int32_t dx, dy; w32_raw_mouse_sample(&dx, &dy, 1);
+    if (test_mode) return;
+    if (on) { [NSCursor hide]; CGAssociateMouseAndMouseCursorPosition(false); }
+    else { CGAssociateMouseAndMouseCursorPosition(true); [NSCursor unhide]; }
+}
+/* the window's shape: 4:3, or (GTA) the launch window's video mode's (GTA_MODE: widescreen, 16:9) */
+static double win_aspect(void)
+{
+#ifdef GTA_EDITION
+    unsigned w, h; const char *e = getenv("GTA_MODE");
+    if (e && sscanf(e, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 200) return (double)w / h;
+#endif
+    return 4.0 / 3;
+}
+static void window_created(uint32_t hwnd, int x, int y, int w, int h, uint32_t style)
+{
+    (void)x; (void)y; (void)w; (void)h; (void)style;
+#ifdef DF_EDITION
+    if (style & 0x40000000u) return;                                  // child windows: none of ours
+    { int first = !game_hwnd; game_hwnd = hwnd; if (!first) return; } // Delta Force 2 makes a new main window when it changes
+                                                                      // driver: input follows it, the Mac window stays
+#else
+    if (game_hwnd) return;                                            // the game has one top-level window
+    game_hwnd = hwnd;
+#endif
+    if (test_mode && getenv("DS_EARLY_MSG")) {   /* development: "msg,wparam;..." posted as the window is made (before the intros) */
+        char *e = strdup(getenv("DS_EARLY_MSG")), *sv, *t = strtok_r(e, ";", &sv);
+        while (t) { unsigned m = 0, wp = 0; if (sscanf(t, "%i,%i", &m, &wp) >= 1) post(m, wp, 0); t = strtok_r(0, ";", &sv); }
+        free(e);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+#ifdef DF_EDITION
+        pad_start();
+#endif
+#ifdef GTA_EDITION
+        gta_pad_start();
+#endif
+        NSRect f = NSScreen.mainScreen.frame;
+        NSWindowStyleMask sm = NSWindowStyleMaskBorderless;
+        if (test_mode && !getenv("DS_DISPLAY")) { f = NSMakeRect(80, 80, 960, 620); sm = NSWindowStyleMaskTitled | NSWindowStyleMaskMiniaturizable; }
+        else if (windowed()) {   /* the launch window's Display: Window, 4:3 at three quarters of the desktop's height */
+            NSRect vf = NSScreen.mainScreen.visibleFrame; CGFloat h = floor(vf.size.height * 0.78), w = floor(h * win_aspect());
+            f = NSMakeRect(NSMidX(vf) - w / 2, NSMidY(vf) - h / 2, w, h);
+            sm = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+        }
+        CGFloat band = 0;   /* full screen below a display's notch (the camera housing): the picture under it, the band black */
+        if (!windowed() && !notch_around() && !(test_mode && !getenv("DS_DISPLAY"))) { if (@available(macOS 12.0, *)) band = NSScreen.mainScreen.safeAreaInsets.top; }
+        win = [[GameWindow alloc] initWithContentRect:f styleMask:sm backing:NSBackingStoreBuffered defer:NO];
+        win.releasedWhenClosed = NO;   /* ARC owns it (AppKit's default releases a closed window once more) */
+        f.origin = NSZeroPoint;
+        win.title = @DS2_TITLE; win.backgroundColor = NSColor.blackColor; win.acceptsMouseMovedEvents = YES;
+        GameView *v = [[GameView alloc] initWithFrame:NSMakeRect(0, 0, f.size.width, f.size.height - band)]; v.wantsLayer = YES;
+        v.layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit;   /* as a subview AppKit would stretch it */
+        if (band > 0) {
+            NSView *box = [[NSView alloc] initWithFrame:f]; box.wantsLayer = YES; box.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+            v.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable; [box addSubview:v]; win.contentView = box;
+        } else win.contentView = v;
+        game_view = v; [win makeFirstResponder:v];
+        if (windowed()) [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
+                                                                     usingBlock:^(NSNotification *n) { (void)n; [NSApp terminate:nil]; }];
+        win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
+        if (windowed()) { win.contentMinSize = NSMakeSize(640, 480); win.contentAspectRatio = NSMakeSize(win_aspect() * 1000, 1000); }
+        [win setLevel:NSNormalWindowLevel];
+        NSWindow *w0 = win;   // the frame cap follows the display the window is on, and a changed refresh rate
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidChangeScreenNotification object:w0 queue:nil usingBlock:^(NSNotification *n) { (void)n; note_display(w0.screen); }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; note_display(w0.screen); }];
+        note_display(w0.screen);
+        /* hidden (another Space or a full-screen app in front, the display asleep, the screen locked): the compositor
+         * stops taking its pictures, and the next one waits a second for one to come free (a 1-second frame, #17) */
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidChangeOcclusionStateNotification object:w0 queue:nil usingBlock:^(NSNotification *n) { (void)n;
+            fprintf(stderr, "host: the window is %s\n", (w0.occlusionState & NSWindowOcclusionStateVisible) ? "shown" : "hidden"); }];
+    });
+}
+static void window_changed(uint32_t hwnd, int x, int y, int w, int h, int visible)
+{
+    (void)x; (void)y; (void)w; (void)h;
+    if (hwnd != game_hwnd) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!win) return;
+        if (visible && !win.visible) {
+            if (test_mode && !getenv("DS_DISPLAY")) [win orderBack:nil];
+            else {
+                if (!windowed()) [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
+                [win makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES]; capture(1);
+            }
+        }
+        else if (!visible && win.visible) { [win orderOut:nil]; capture(0); }
+    });
+}
+
+/* The game's resolution lives in DungeonSiege2.ini (width/height at the top, before any [section]). With none set, use
+ * this screen's size (in points); DS_RESOLUTION=WxH sets it explicitly. Test runs keep the game's own default unless
+ * DS_RESOLUTION is given. */
+static void ensure_resolution(const char *drive_c)
+{
+    char dir[1200], path[1300];
+    snprintf(dir, sizeof dir, "%s/Users/player/Documents/My Games/Dungeon Siege 2", drive_c);
+    snprintf(path, sizeof path, "%s/DungeonSiege2.ini", dir);
+    if (getenv("DS_TEST") && !getenv("DS_RESOLUTION")) return;
+    int w = w32_screen_w, h = w32_screen_h, force = 0;
+    const char *r = getenv("DS_RESOLUTION");
+    if (r && sscanf(r, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 480) force = 1; else { w = w32_screen_w; h = w32_screen_h; }
+    NSString *text = [NSString stringWithContentsOfFile:@(path) encoding:NSISOLatin1StringEncoding error:nil] ?: @"";
+    NSMutableArray<NSString *> *lines = [[text componentsSeparatedByString:@"\n"] mutableCopy];
+    if (lines.count && [lines.lastObject isEqualToString:@""]) [lines removeLastObject];
+    int has_w = 0, has_h = 0, has_bpp = 0, top = 1;
+    for (NSUInteger k = 0; k < lines.count; k++) {
+        NSString *t = [lines[k] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if ([t hasPrefix:@"["]) top = 0;
+        if (!top) continue;
+        NSString *key = [[t componentsSeparatedByString:@"="].firstObject stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].lowercaseString;
+        if ([key isEqualToString:@"width"]) { has_w = 1; if (force) lines[k] = [NSString stringWithFormat:@"width = %d", w]; }
+        if ([key isEqualToString:@"height"]) { has_h = 1; if (force) lines[k] = [NSString stringWithFormat:@"height = %d", h]; }
+        if ([key isEqualToString:@"bpp"]) has_bpp = 1;
+    }
+    if (has_w && has_h && !force) return;
+    NSMutableArray<NSString *> *add = [NSMutableArray array];
+    if (!has_w) [add addObject:[NSString stringWithFormat:@"width = %d", w]];
+    if (!has_h) [add addObject:[NSString stringWithFormat:@"height = %d", h]];
+    if (!has_bpp) [add addObject:@"bpp = 32"];
+    [lines insertObjects:add atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, add.count)]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:@(dir) withIntermediateDirectories:YES attributes:nil error:nil];
+    [[[lines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"] writeToFile:@(path) atomically:YES encoding:NSISOLatin1StringEncoding error:nil];
+    fprintf(stderr, "host: resolution %dx%d (%s)\n", w, h, path);
+}
+
+static void type_text(NSString *text)
+{
+    static const struct { unichar ch; uint16_t code; } letters[] = {{'a',0},{'s',1},{'d',2},{'f',3},{'h',4},{'g',5},{'z',6},{'x',7},{'c',8},{'v',9},
+        {'b',11},{'q',12},{'w',13},{'e',14},{'r',15},{'y',16},{'t',17},{'1',18},{'2',19},{'3',20},{'4',21},{'6',22},{'5',23},{'9',25},{'7',26},
+        {'8',28},{'0',29},{'o',31},{'u',32},{'i',34},{'p',35},{'l',37},{'j',38},{'k',40},{'n',45},{'m',46},{' ',49},
+        {'.',47},{',',43},{'-',27},{'=',24},{'/',44},{';',41},{'\'',39}};
+    void (^send)(NSString *, uint16_t) = ^(NSString *chars, uint16_t code) {
+        for (int up = 0; up < 2; up++) {
+            NSEvent *ev = [NSEvent keyEventWithType:up ? NSEventTypeKeyUp : NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0
+                                       windowNumber:win.windowNumber context:nil characters:chars charactersIgnoringModifiers:chars isARepeat:NO keyCode:code];
+            [win sendEvent:ev];
+        }
+    };
+    for (NSUInteger k = 0; k < text.length; k++) {
+        if ([[text substringFromIndex:k] hasPrefix:@"{esc}"]) { send(@"\x1b", 0x35); k += 4; continue; }
+        if ([[text substringFromIndex:k] hasPrefix:@"{enter}"]) { send(@"\r", 0x24); k += 6; continue; }
+        if ([[text substringFromIndex:k] hasPrefix:@"{bs}"]) { send(@"\x7f", 0x33); k += 3; continue; }
+        unichar ch = [text characterAtIndex:k], lo = (unichar)tolower(ch); uint16_t code = 0xffff;
+        for (size_t j = 0; j < sizeof letters / sizeof *letters; j++) if (letters[j].ch == lo) code = letters[j].code;
+        if (code != 0xffff) send([NSString stringWithCharacters:&ch length:1], code);
+    }
+}
+
+@interface AppDelegate : NSObject <NSApplicationDelegate> @end
+@implementation AppDelegate
+- (void)applicationDidBecomeActive:(NSNotification *)n { (void)n; if (win.visible) capture(1); post(0x1c, 1, 0); }
+- (void)applicationDidResignActive:(NSNotification *)n { (void)n; capture(0); post(0x1c, 0, 0); }
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)s { (void)s; return NSTerminateNow; }
+@end
+
+/* After a crash: say so, and offer the report (not in test mode). In the sandbox (Delta Force) Finder can't be asked to
+ * show it; the next start, before the sandbox, offers it again. */
+static int sandboxed;
+static void show_report_alert(NSString *title, NSString *path)
+{
+    NSAlert *al = [NSAlert new]; al.alertStyle = NSAlertStyleWarning; al.messageText = title;
+    al.informativeText = [NSString stringWithFormat:@"A report was saved:\n%@\n\nIt says what the game was doing, so the problem can be found and fixed.%@", path,
+                          sandboxed ? @"\n\nThe game will offer to show it the next time it starts." : @""];
+    if (sandboxed) { [al addButtonWithTitle:@"OK"]; [NSApp activateIgnoringOtherApps:YES]; [al runModal]; return; }
+    [al addButtonWithTitle:@"Show Report"]; [al addButtonWithTitle:@"OK"];
+    [NSApp activateIgnoringOtherApps:YES];
+    if ([al runModal] == NSAlertFirstButtonReturn) [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
+}
+static void *game_thread(void *arg)
+{
+    (void)arg; char msg[256];
+    uint32_t code = w32_run(msg, sizeof msg);
+    fprintf(stderr, "host: game ended: %s\n", msg);
+    game_running = 0;
+    const char *rp = !strncmp(msg, "fault", 5) ? w32_crash_last_path() : 0;
+    NSString *path = rp ? @(rp) : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        capture(0);
+        if (path && !test_mode) {
+            [win orderOut:nil]; [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+            show_report_alert(@"Dungeon Siege stopped unexpectedly.", path);
+        }
+        exit((int)code);
+    });
+    return 0;
+}
+/* A report from the last session that nobody has seen yet (a crash, or a hang the user had to force-quit). */
+static void report_from_last_session(const char *data)
+{
+    NSString *dir = [NSString stringWithFormat:@"%s/CrashReports", data], *marker = [dir stringByAppendingPathComponent:@".last-shown"];
+    NSString *seen = [NSString stringWithContentsOfFile:marker encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSString *newest = nil;
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil])
+        if (([f hasPrefix:@"crash-"] || ([f hasPrefix:@"hang-"] && ![f hasPrefix:@"hang-recovered-"])) && (!newest || [f compare:newest] == NSOrderedDescending)) newest = f;
+    if (!newest || [newest compare:seen] != NSOrderedDescending) return;
+    [newest writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    show_report_alert([newest hasPrefix:@"hang-"] ? @"Last time, Dungeon Siege stopped responding." : @"Last time, Dungeon Siege stopped unexpectedly.",
+                      [dir stringByAppendingPathComponent:newest]);
+}
+static void on_objc_exception(NSException *e)
+{
+    char r[400]; snprintf(r, sizeof r, "The macOS side of the program raised an Objective-C exception: %s: %s.", e.name.UTF8String, e.reason.UTF8String ?: "");
+    w32_crash_report("crash", r, 0, 0);
+}
+
+#ifdef DF_EDITION
+/* The game process in a macOS sandbox (Delta Force: its multiplayer puts 1998 network code within reach of anyone
+ * who finds a public game). From here on it can read the game folder, the program's own folder and the data folder,
+ * write only the data folder and temporary files, start no other program and have none opened for it (LaunchServices,
+ * Apple events); the rest of the user's home folder and other volumes can't be read. Everything else the system needs (graphics, sound, the window server, the network)
+ * stays as it is. In a sandbox profile the last matching rule wins, so each "allow" below narrows the "deny" before
+ * it. DF_NO_SANDBOX=1 leaves it out. */
+static void sbx_quote(char *out, size_t cap, const char *path)       /* a resolved path as an SBPL string literal */
+{
+    char real[PATH_MAX]; if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
+    size_t n = 0; if (cap < 4) return; out[n++] = '"';
+    for (const char *s = real; *s && n + 3 < cap; s++) { if (*s == '"' || *s == '\\') out[n++] = '\\'; out[n++] = *s; }
+    out[n++] = '"'; out[n] = 0;
+}
+static void enter_sandbox(const char *exe, const char *game, const char *data, const char *bin)
+{
+    if (getenv("DF_NO_SANDBOX") && atoi(getenv("DF_NO_SANDBOX"))) { fprintf(stderr, "host: no sandbox (DF_NO_SANDBOX)\n"); return; }
+    char exedir[PATH_MAX]; snprintf(exedir, sizeof exedir, "%s", exe); char *sl = strrchr(exedir, '/'); if (sl) *sl = 0; else snprintf(exedir, sizeof exedir, ".");
+    char appdir[PATH_MAX]; snprintf(appdir, sizeof appdir, "%s/..", bin);   /* the .app's Contents (or the build's app folder's parent) */
+    const char *home = getenv("HOME"); struct passwd *pw = getpwuid(getuid()); if (pw && pw->pw_dir) home = pw->pw_dir;
+    char G[PATH_MAX + 8], D[PATH_MAX + 8], E[PATH_MAX + 8], A[PATH_MAX + 8], Hm[PATH_MAX + 8];
+    sbx_quote(G, sizeof G, game); sbx_quote(D, sizeof D, data); sbx_quote(E, sizeof E, exedir); sbx_quote(A, sizeof A, appdir); sbx_quote(Hm, sizeof Hm, home ? home : "/Users");
+    char prof[16384];
+    snprintf(prof, sizeof prof,
+        "(version 1)\n(allow default)\n"
+        "(deny file-write* (subpath \"/\"))\n"
+        "(allow file-write* (subpath %s) (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/dev\"))\n"
+        "(deny file-read* (subpath %s) (subpath \"/Volumes\"))\n"
+        "(allow file-read* (literal %s) (subpath %s) (subpath %s) (subpath %s) (subpath %s))\n"
+        "(deny process-exec* process-fork)\n"
+        "(deny lsopen)\n(deny appleevent-send)\n",   /* nor have LaunchServices or another app open something for it */
+        D, Hm, Hm, G, D, E, A);
+    char *err = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"          /* the documented call; still what the system uses */
+    int bad = sandbox_init(prof, 0, &err);
+#pragma clang diagnostic pop
+    if (bad) { fprintf(stderr, "host: sandbox not applied: %s\n", err ? err : "?"); return; }
+    sandboxed = 1;
+    fprintf(stderr, "host: sandboxed (reads the game, program and data folders; writes the data folder)\n");
+}
+#endif
+
+#if defined(DF_EDITION) || defined(GTA_EDITION)
+/* Opened from Finder (no arguments): the app's own settings, written by install.sh in Contents/Resources/launch.plist
+ * (game folder, data folder, log name, executable, updater), do what the generated launcher script does. The bundle's
+ * executable is this binary, not a script: macOS only recognises a game, and so only turns on Game Mode, for a bundle
+ * whose executable is the program itself. DF_GAME_DIR and DF_DATA_DIR still override the folders. */
+static int bundle_launch(const char *argv0, const char **exe, const char **game, const char **data)
+{
+    NSString *bin = [@(argv0) stringByDeletingLastPathComponent], *res = [bin stringByAppendingPathComponent:@"../Resources"].stringByStandardizingPath;
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:[res stringByAppendingPathComponent:@"launch.plist"]];
+    if (!cfg[@"game"] || !cfg[@"data"]) return 0;
+    NSString *g = getenv("DF_GAME_DIR") ? @(getenv("DF_GAME_DIR")) : cfg[@"game"], *d = getenv("DF_DATA_DIR") ? @(getenv("DF_DATA_DIR")) : cfg[@"data"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *log = [d stringByAppendingPathComponent:[cfg[@"log"] ?: @"DeltaForce" stringByAppendingString:@".log"]];
+    if (!getenv("DS_NO_LAUNCHER") && [[fm attributesOfItemAtPath:log error:nil] fileSize] > 5000000) {   /* keep the log small: previous one as .old */
+        NSString *old = [[log stringByDeletingPathExtension] stringByAppendingString:@".old.log"];
+        [fm removeItemAtPath:old error:nil]; [fm moveItemAtPath:log toPath:old error:nil];
+    }
+    freopen(log.fileSystemRepresentation, "a", stderr); setvbuf(stderr, NULL, _IOLBF, 0);   /* reopened stderr is fully buffered: lines lost at a kill */
+    setenv("DS_LOG_FILE", log.fileSystemRepresentation, 1);                                      /* crash reports attach this log */
+    NSString *upd = [bin stringByAppendingPathComponent:@"update"];
+    if ([fm isExecutableFileAtPath:upd] && cfg[@"branch"]) {                                       /* the launcher's Updates row */
+        setenv("DS_UPDATER", upd.fileSystemRepresentation, 1); setenv("DS_UPDATE_BRANCH", [cfg[@"branch"] UTF8String], 1);
+        setenv("DS_BUILT_COMMIT", [cfg[@"built"] ?: @"" UTF8String], 1);
+    }
+    *exe = strdup([res stringByAppendingPathComponent:cfg[@"exe"] ?: @GAME_EXE].fileSystemRepresentation);
+    *game = strdup(g.fileSystemRepresentation); *data = strdup(d.fileSystemRepresentation);
+    return 1;
+}
+#endif
+
+/* The display's idle sleep. A game played with a controller alone gives macOS no keyboard or mouse activity, so the
+ * display could go dark mid-game: while the game is the active app it is kept on (let go while another app is in
+ * front). Test runs, in the background, don't hold it (DS_KEEP_AWAKE=1 does, to check it). The display going to sleep
+ * and the screen locking are logged: then, as when the window goes to another Space, the window's next picture waits
+ * a second for one to come free (Core Animation's limit), which the game sees as one 1-second frame. */
+static void display_awake(void)
+{
+    static id act; static int force = -1;
+    if (force < 0) force = getenv("DS_KEEP_AWAKE") && atoi(getenv("DS_KEEP_AWAKE")) > 0;
+    void (^update)(void) = ^{
+        BOOL want = (NSApp.isActive && !test_mode) || force;
+        if (want && !act) { act = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityIdleDisplaySleepDisabled | NSActivityUserInitiated reason:@"playing"];
+                            fprintf(stderr, "host: the display is kept on while the game is in front\n"); }
+        else if (!want && act) { [[NSProcessInfo processInfo] endActivity:act]; act = nil; }
+    };
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter], *ws = [[NSWorkspace sharedWorkspace] notificationCenter];
+    [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; update(); }];
+    [nc addObserverForName:NSApplicationDidResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; update(); }];
+    [ws addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; fprintf(stderr, "host: the display went to sleep\n"); }];
+    [ws addObserverForName:NSWorkspaceScreensDidWakeNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; fprintf(stderr, "host: the display woke\n"); }];
+    [[NSDistributedNotificationCenter defaultCenter] addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; fprintf(stderr, "host: the screen was locked\n"); }];
+    [[NSDistributedNotificationCenter defaultCenter] addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; fprintf(stderr, "host: the screen was unlocked\n"); }];
+    update();
+}
+
+int main(int argc, char **argv)
+{
+    if (getenv("DS_LOG_FILE")) setvbuf(stderr, NULL, _IOLBF, 0);   /* a launcher sent stderr to the log: keep lines on a kill */
+    @autoreleasepool {
+        const char *exe = 0, *game = 0, *data = 0;
+        for (int k = 1; k + 1 < argc; k += 2) {
+            if (!strcmp(argv[k], "--exe")) exe = argv[k + 1];
+            else if (!strcmp(argv[k], "--game")) game = argv[k + 1];
+            else if (!strcmp(argv[k], "--data")) data = argv[k + 1];
+        }
+#if defined(DF_EDITION) || defined(GTA_EDITION)
+        if (!exe && !game && !data) bundle_launch(argv[0], &exe, &game, &data);
+#endif
+        if (!exe || !game || !data) { fprintf(stderr, "usage: %s --exe <game exe> --game <game folder> --data <data folder>\n", argv[0]); return 1; }
+        NSString *bin = [[NSString stringWithUTF8String:argv[0]] stringByDeletingLastPathComponent];
+        snprintf(dsr_snapshot_path, sizeof dsr_snapshot_path, "%s/dsr_snapshot.bin", bin.UTF8String);
+        char drive_c[1024], overlay[1024];
+        snprintf(drive_c, sizeof drive_c, "%s/drive_c", data); snprintf(overlay, sizeof overlay, "%s/game", data);
+        mkdir(data, 0755); mkdir(drive_c, 0755); mkdir(overlay, 0755);
+        NSRect sf = NSScreen.mainScreen.frame; w32_screen_w = (int)sf.size.width; w32_screen_h = (int)sf.size.height;
+        w32_screen_scale = NSScreen.mainScreen.backingScaleFactor;
+        init_keymap();
+        {   /* the launch window (resolution, frame rate, updates) unless in test mode */
+            int ds_launcher_run(const char *game_dir, const char *data_dir);
+            if (!getenv("DS_TEST") || getenv("DS_LAUNCHER_SHOT")) {
+                [NSApplication sharedApplication]; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+                int shown = !getenv("DS_NO_LAUNCHER");
+                if (!ds_launcher_run(game, data)) return 0;
+#if defined(DF_EDITION) || defined(GTA_EDITION)
+                /* Play: the game in a fresh process (the choices are saved, and in the environment), this one ends. A game
+                 * window shown by the process that ran the launch window can stay off screen in macOS full screen (seen in
+                 * the Diablo II port); a process that never showed it always comes up. Before the sandbox, which forbids it. */
+                if (shown && !getenv("DS_LAUNCHER_SHOT") && !getenv("DS_SAME_PROCESS")) {
+                    extern char **environ; setenv("DS_NO_LAUNCHER", "1", 1); pid_t pid;
+                    int rc = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+                    fprintf(stderr, "%s: the game in a new process (%d, %s)\n", DS2_TITLE, rc ? -1 : (int)pid, rc ? strerror(rc) : "started");
+                    if (rc == 0) return 0;
+                    unsetenv("DS_NO_LAUNCHER");                           /* could not: carry on here */
+                }
+#else
+                (void)shown;
+#endif
+            }
+        }
+        w32_crash_init(data, DS_BUILD); w32_crash_thread("macOS UI thread");
+        { void w32_registry_install(const char *); w32_registry_install(data); }   /* values the game's installer would have written */
+        NSSetUncaughtExceptionHandler(on_objc_exception);
+#if !defined(DF_EDITION) && !defined(GTA_EDITION)
+        ensure_resolution(drive_c);                                   // DungeonSiege2.ini
+#endif
+        test_mode = getenv("DS_TEST") && atoi(getenv("DS_TEST"));
+        if (test_mode) parse_script();
+        if (!test_mode && !windowed() && getenv("DS_NATIVE_PANEL") && atoi(getenv("DS_NATIVE_PANEL")) > 0) native_panel();
+
+        [NSApplication sharedApplication]; [NSApp setActivationPolicy:test_mode ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular];
+        AppDelegate *del = [AppDelegate new]; NSApp.delegate = del;
+        NSMenu *bar = [NSMenu new], *appm = [NSMenu new]; NSMenuItem *it = [NSMenuItem new]; it.submenu = appm; [bar addItem:it];
+        [appm addItemWithTitle:@"Quit " DS2_TITLE action:@selector(terminate:) keyEquivalent:@"q"]; NSApp.mainMenu = bar;
+        display_awake();
+
+        layer = [CAMetalLayer layer]; layer.device = MTLCreateSystemDefaultDevice(); layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = YES; layer.opaque = YES; layer.contentsGravity = kCAGravityResizeAspect; layer.maximumDrawableCount = 3;
+        layer.displaySyncEnabled = getenv("DSR_VSYNC") ? atoi(getenv("DSR_VSYNC")) != 0 : YES;
+        layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+        note_display(nil);
+
+        void *m = mmap(0, DSR_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        H = m; ring = (uint8_t *)m + DSR_HEADER_SIZE; H->magic = DSR_SHM_MAGIC; H->version = 1;
+        dsr_attach_consumer(H);
+        w32_host_window_created = window_created; w32_host_window_changed = window_changed;
+        if (w32_prepare(exe, game, drive_c, overlay)) { fprintf(stderr, "host: cannot load %s\n", exe); return 1; }
+        if (!test_mode) report_from_last_session(data);
+#ifdef DF_EDITION
+        enter_sandbox(exe, game, data, bin.UTF8String);
+#endif
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *tm) { (void)tm; w32_crash_heartbeat(2); }];   /* UI thread alive */
+        if (test_mode && getenv("DS_CRASHTEST") && !strncmp(getenv("DS_CRASHTEST"), "uihang", 6))
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(getenv("DS_CRASHTEST") + 7) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ sleep(14); });
+
+        pthread_attr_t a; pthread_t t;
+        pthread_attr_init(&a); pthread_attr_set_qos_class_np(&a, QOS_CLASS_USER_INTERACTIVE, 0);
+        pthread_create(&t, &a, render_thread, 0);
+        pthread_attr_setstacksize(&a, 256u << 20);
+        pthread_create(&t, &a, game_thread, 0);
+        [NSApp run];
+    }
+    return 0;
+}
