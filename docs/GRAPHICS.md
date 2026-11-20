@@ -20,6 +20,11 @@ variables, listed below); what is changed in the game lasts for that session.
 | Brightness | Display Setup | Display Setup | Display Setup | The game's gamma ramp, applied as the picture is shown |
 | Visual FX quality, MIP mapping | — | — | Advanced | The game's own |
 
+**Car lights at night.** GTA III and Vice City draw a see-through box, untextured and hard-edged, standing out from
+each lit head and tail light (CBrightLights); on today's screens they read as boxes in front of the lamps. They are
+left out here: the lamps' own lit textures and glows stay, as do the traffic lights' and sirens' bright lights.
+`GTA_CAR_LIGHT_BOXES=1` brings the boxes back.
+
 ## Widescreen
 
 The games were made for 4:3. Their own widescreen settings crop the top and bottom of the 4:3 view; this port keeps
@@ -75,6 +80,11 @@ The fixed-function texture stages are drawn by shaders made for each combination
 and alpha test (Metal function constants), not by one shader that chooses them for every pixel: at Retina sizes that
 choosing was most of the GPU's time. Metal compiles each new combination the first time it is drawn and keeps it, so
 the first minutes after an update can hitch now and then.
+
+Every texture-stage operation the device reports is drawn, including MULTIPLYADD, LERP and the modulate-and-add
+pairs. Vice City and San Andreas paint their cars' reflections with MULTIPLYADD: the car's colour plus the reflection
+times the texture factor (a quarter in Vice City, about a tenth in San Andreas). Before that operation was drawn, the
+reflection replaced the paint and hid the car's colour. GTA III draws its reflections with other operations.
 
 What an M1 Pro holds at 4112×2658 with 4x antialiasing, 16x texture filtering and PS2 lighting, capped at 120, driving:
 

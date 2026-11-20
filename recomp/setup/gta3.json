@@ -1,0 +1,78 @@
+{
+  "release_repo": "Joshspeakman/gta-classics-macos",
+  "tag_lowercase": true,
+  "cc_args": [
+    "-fPIC",
+    "-DRT_HOST_RC_INIT=UINT32_MAX"
+  ],
+  "rt_opt": "-O1",
+  "frameworks": [
+    "AppKit",
+    "GameController",
+    "Metal",
+    "QuartzCore",
+    "CoreText",
+    "CoreGraphics",
+    "CoreFoundation",
+    "AudioToolbox",
+    "AVFoundation",
+    "CoreMedia",
+    "CoreImage"
+  ],
+  "style": "iron",
+  "local_network": "The games don't use your local network.",
+  "name": "Grand Theft Auto III",
+  "folder": "Grand Theft Auto III",
+  "binary": "GTA3",
+  "icon_label": "III",
+  "version": "the Mac Steam release (app 12230)",
+  "where": "Your Grand Theft Auto 3 from Steam (the Mac release, app 12230: its app, or the GTAIII folder inside it)",
+  "minutes": 4,
+  "space_gb": 3,
+  "build_gb": 1,
+  "exe": "gta3.exe",
+  "exe_sha256": {
+    "7fd2749072b1d1b04737b44d7d8173c2c00cd419bb8f1983c0067578e6229267": {
+      "version": "Steam (Mac, 12230)",
+      "patch": [
+        [
+          "steamstub21.py",
+          "{exe}",
+          "{exe}"
+        ]
+      ]
+    }
+  },
+  "inside": [
+    "Contents/Resources/transgaming/c_drive/Program Files/Rockstar Games/GTAIII"
+  ],
+  "required": [
+    "data",
+    "models",
+    "audio",
+    "txd",
+    "anim",
+    "Mss32.dll"
+  ],
+  "libs": [],
+  "lift_args": [
+    "--game",
+    "gta3"
+  ],
+  "art": [
+    "gta_art.py",
+    "gta3",
+    "{art}"
+  ],
+  "log": "GTA3",
+  "build": "./build_gta3.sh \"$GAME\"",
+  "out": "work/gta3",
+  "rt_cflags": [
+    "-DGTA3_EDITION"
+  ],
+  "host_cflags": [
+    "-DGTA3_EDITION"
+  ],
+  "title": "GRAND THEFT AUTO III",
+  "bundle_id": "io.github.joshspeakman.gta-classics"
+}

@@ -245,7 +245,10 @@ uint32_t gta_pad_axes(float ax[6])   /* dinput8.c w32_di_pad, 250 times a second
 static volatile uint32_t pad_mapped;   /* the PS2 buttons last reported (gta_pad_aiming) */
 uint32_t gta_pad_layout_(uint32_t b);
 uint32_t gta_pad_layout(uint32_t b) { uint32_t r = gta_pad_layout_(b); pad_mapped = r; return r; }
-static int gta_pad_aiming(void) { return (pad_mapped >> 7) & 1; }   /* R1 (Modern: LT): targeting */
+static volatile int mouse_held;   /* the mouse's left and right buttons (gta_mouse_button) */
+void gta_mouse_button(int b, int down) { if (b == 0 || b == 1) { if (down) __atomic_or_fetch(&mouse_held, 1 << b, __ATOMIC_RELAXED); else __atomic_and_fetch(&mouse_held, ~(1 << b), __ATOMIC_RELAXED); } }
+static int gta_pad_aiming(void) { return ((pad_mapped >> 7) & 1) || mouse_held; }   /* R1 (Modern: LT): targeting; or the mouse's fire or aim
+                                                                                     button held (the PC control: facing where the camera looks) */
 uint32_t gta_pad_layout_(uint32_t b)   /* the controller's buttons -> the PS2 pad's (same bit numbering) */
 {
     static int modern = -1; if (modern < 0) { const char *e = getenv("GTA_CONTROLS"); modern = e && !strcmp(e, "modern"); }
@@ -485,21 +488,68 @@ enum { CAM = 0x0070be38u, CAM_CAMS = 0x1a4, CAM_SIZE = 0x1a4, CAM_SRC = 0x14c, C
 #else
 enum { CAM = 0x007e3690u, CAM_CAMS = 0x188, CAM_SIZE = 0x1cc, CAM_SRC = 0x174, CAM_SRC2 = 0x180 };
 #endif
+/* The mouse (Modern) looks round the car the same way, as in today's games: the camera stays where the mouse leaves it
+ * (placed round the car each frame, the string's pull held off), up and down raise and lower it round the car, and once
+ * the mouse has been still for a moment while the car moves it eases back behind. GTA III and Vice City read the mouse
+ * in vehicles for nothing else (dinput8.c w32_di_mouse_move passes the movement here as well). */
+static volatile int look_mx, look_my;   /* the mouse's movement in a vehicle since the last frame */
+void gta_mouse_look(int dx, int dy)     /* dinput8.c, each mouse movement (the host's, and the right stick's on foot) */
+{
+    static int modern = -1; if (modern < 0) { const char *e = getenv("GTA_CONTROLS"); modern = e && !strcmp(e, "modern"); }
+    if (!modern || gta_menu_frame() || pad_context() == CTX_FOOT) return;
+    __atomic_fetch_add(&look_mx, dx, __ATOMIC_RELAXED); __atomic_fetch_add(&look_my, dy, __ATOMIC_RELAXED);
+}
+static double wrap_pi(double a) { while (a > M_PI) a -= 2 * M_PI; while (a < -M_PI) a += 2 * M_PI; return a; }
 static void car_orbit(void)
 {
     static double last; double now = now_ms(), dt = last ? (now - last) / 1000 : 0; last = now; if (dt > 0.05) dt = 0.05;
-    float rx = orbit_rx; if (!rx || !dt) return;
-    uint8_t a = G_MEM[CAM + 0x76]; if (a >= 3) return;
-    uint32_t cam = CAM + CAM_CAMS + a * CAM_SIZE; if (rt_r16(G_MEM, cam + 0xc) != 18) return;   /* MODE_CAM_ON_A_STRING */
-    uint32_t v = player_vehicle(); if (!v) return;
-    float cx, cy; memcpy(&cx, G_MEM + v + 0x34, 4); memcpy(&cy, G_MEM + v + 0x38, 4);
-    double t = -rx * (rx < 0 ? -rx : rx) * 3.0 * dt, c = cos(t), sn = sin(t);   /* up to 3 radians a second, squared: right turns the view right */
+    static int look; static double yaw, pitch, still, h0;   /* the mouse's look: on; radians from behind the car and up from
+                                                                where the camera was; seconds the mouse has been still;
+                                                                the camera's height over the car when it began */
+    int mx = __atomic_exchange_n(&look_mx, 0, __ATOMIC_RELAXED), my = __atomic_exchange_n(&look_my, 0, __ATOMIC_RELAXED);
+    float rx = orbit_rx;
+    uint8_t a = G_MEM[CAM + 0x76]; uint32_t v = player_vehicle();
+    if (a >= 3 || !v) { look = 0; return; }
+    uint32_t cam = CAM + CAM_CAMS + a * CAM_SIZE; if (rt_r16(G_MEM, cam + 0xc) != 18) { look = 0; return; }   /* MODE_CAM_ON_A_STRING */
+    if (!dt) return;
+    float cx = rdf(v + 0x34), cy = rdf(v + 0x38), cz = rdf(v + 0x3c);
+    if (!look && !mx && !my) {   /* the right stick alone: the camera turned about the car, the string brings it back */
+        if (!rx) return;
+        double t = -rx * (rx < 0 ? -rx : rx) * 3.0 * dt, c = cos(t), sn = sin(t);   /* up to 3 radians a second, squared: right turns the view right */
+        for (int k = 0; k < 2; k++) {
+            uint32_t at = cam + (k ? CAM_SRC2 : CAM_SRC); float x = rdf(at), y = rdf(at + 4);
+            double dx = x - cx, dy = y - cy; if (dx * dx + dy * dy > 40 * 40) continue;   /* not this car's camera */
+            wrf(at, (float)(cx + dx * c - dy * sn)); wrf(at + 4, (float)(cy + dx * sn + dy * c));
+        }
+        return;
+    }
+    double ox = rdf(cam + CAM_SRC) - cx, oy = rdf(cam + CAM_SRC + 4) - cy, d = sqrt(ox * ox + oy * oy);
+    if (d > 40 || d < 0.5) { look = 0; return; }   /* not this car's camera */
+    double behind = atan2(-rdf(v + 0x18), -rdf(v + 0x14));   /* the car's forward vector, reversed */
+    if (!look) { look = 1; yaw = wrap_pi(atan2(oy, ox) - behind); pitch = 0; h0 = rdf(cam + CAM_SRC + 8) - cz; still = 0; }
+    if (mx || my) {   /* as the game's own mouse camera on foot (its default sensitivity): right turns the view right,
+                         down looks down */
+        yaw = wrap_pi(yaw - mx * 0.0025); pitch += my * 0.0025; still = 0;
+        if (pitch < -0.35) pitch = -0.35; if (pitch > 1.0) pitch = 1.0;
+    } else still += dt;
+    if (rx) { yaw = wrap_pi(yaw - rx * (rx < 0 ? -rx : rx) * 3.0 * dt); still = 0; }
+    if (still > 1.5) {   /* let go: back behind while the car moves */
+        float vx = rdf(v + VEH_SPEED), vy = rdf(v + VEH_SPEED + 4);
+        if (vx * vx + vy * vy > 0.02f * 0.02f) {
+            double k = exp(-2.5 * dt); yaw *= k; pitch *= k;
+            if (fabs(yaw) < 0.03 && fabs(pitch) < 0.03) look = 0;
+        }
+    }
+    double ang = behind + yaw, z = cz + h0 + d * sin(pitch); if (z < cz + 0.3) z = cz + 0.3;
     for (int k = 0; k < 2; k++) {
-        uint32_t at = cam + (k ? CAM_SRC2 : CAM_SRC); float x, y; memcpy(&x, G_MEM + at, 4); memcpy(&y, G_MEM + at + 4, 4);
-        double dx = x - cx, dy = y - cy; if (dx * dx + dy * dy > 40 * 40) continue;   /* not this car's camera */
-        wrf(at, (float)(cx + dx * c - dy * sn)); wrf(at + 4, (float)(cy + dx * sn + dy * c));
+        uint32_t at = cam + (k ? CAM_SRC2 : CAM_SRC); double dx = rdf(at) - cx, dy = rdf(at + 4) - cy, r = sqrt(dx * dx + dy * dy);
+        if (r > 40) continue;
+        if (k) r = d;
+        wrf(at, (float)(cx + r * cos(ang))); wrf(at + 4, (float)(cy + r * sin(ang))); wrf(at + 8, (float)z);
     }
 }
+#else
+void gta_mouse_look(int dx, int dy) { (void)dx; (void)dy; }   /* San Andreas: its own mouse camera in vehicles */
 #endif
 void gta_frame_prefs(int menu)   /* each Present (d3d9.c); menu: no 3D drawn in the frame */
 {
@@ -704,12 +754,31 @@ static int hf_hook(Ctx *c, uint32_t addr)
     return 0;
 #endif
 }
+/* CBrightLights::RegisterOne (pos, up, side, front: 12 floats, then the type byte; cdecl): the head and tail lights'
+ * "bright lights" (types 4-11, front and rear in four shapes) are see-through boxes standing out from the lamps, drawn
+ * untextured with hard edges; today's screens show them as boxes in front of the lights. Not registered (the lamps'
+ * own lit textures and coronas remain); traffic lights and sirens keep theirs. GTA_CAR_LIGHT_BOXES=1 keeps them. */
+#ifndef HIGH_FPS_SA
+#if defined(GTA3_EDITION)
+enum { BRIGHT_LIGHT = 0x0051ad90u };
+#else
+enum { BRIGHT_LIGHT = 0x00571710u };
+#endif
+static int car_light_box(Ctx *c)
+{
+    static int keep = -1; if (keep < 0) { const char *e = getenv("GTA_CAR_LIGHT_BOXES"); keep = e && *e == '1'; }
+    uint8_t type = G_MEM[c->esp + 0x34];
+    if (keep || type < 4 || type > 11) return 0;
+    c->esp += 4; return 1;   /* returned at once */
+}
+#endif
 /* CParticle::Update (no arguments): only when a 30 fps frame's time has passed, with all of it */
 #ifdef HIGH_FPS_SA
 int gta3_override(Ctx *c, uint32_t addr) { (void)c; (void)addr; return 0; }
 #else
 int gta3_override(Ctx *c, uint32_t addr)
 {
+    if (addr == BRIGHT_LIGHT) return car_light_box(c);
     if (addr != PARTICLES || !hf_on() || rt_r32(G_MEM, c->esp) != PARTICLES_RET) return 0;   /* only CGame::Process's call,
                                                                                          whose return puts the step back */
     hf_update(); float step = rdf(TIME_STEP); hf.particles += step;

@@ -48,6 +48,9 @@ void w32_di_mouse_move(int dx, int dy)
     pthread_mutex_lock(&di_lock);
     if (mouse && mouse->acquired) { mouse->dx += dx; mouse->dy += dy; if (dx) enqueue(mouse, 0, (uint32_t)dx); if (dy) enqueue(mouse, 4, (uint32_t)dy); }
     pthread_mutex_unlock(&di_lock);
+#ifdef GTA_EDITION
+    { void gta_mouse_look(int, int); gta_mouse_look(dx, dy); }   /* gta3_mode.c: Modern, GTA III and Vice City in vehicles: the camera */
+#endif
 }
 void w32_di_mouse_wheel(int dz)
 {
@@ -62,6 +65,9 @@ void w32_di_mouse_button(int b, int down)
     uint8_t v = down ? 0x80 : 0;
     if (mbuttons[b] != v) { mbuttons[b] = v; enqueue(mouse, 12u + (uint32_t)b, v); }
     pthread_mutex_unlock(&di_lock);
+#ifdef GTA_EDITION
+    { void gta_mouse_button(int, int); gta_mouse_button(b, down); }   /* gta3_mode.c: Modern, fire or aim held */
+#endif
 }
 void w32_di_release_all(void)                                       /* focus lost: every key and button up */
 {

@@ -258,7 +258,8 @@ GTA3_HOOKS = {
     0x00552e76: 'high frame rates: millisecond timer time step',
     0x0057f4d3: 'high frame rates: radio station name frames',
 }
-GTA3_OVERRIDES = {0x0050e630: 'CParticle::Update: 30 times a second at high frame rates (gta3_mode.c gta3_override)'}
+GTA3_OVERRIDES = {0x0050e630: 'CParticle::Update: 30 times a second at high frame rates (gta3_mode.c gta3_override)',
+                  0x0051ad90: 'CBrightLights::RegisterOne: no boxes on car lights (gta3_mode.c car_light_box)'}
 GTAVC_HOOKS = {
     0x006000e0: 'WinMain frame limiter: the time since the last frame due, by a steady clock (gta3_mode.c LIMIT_TEST)',
     0x006000fc: 'WinMain frame limiter: a frame runs, the next one due an interval later (LIMIT_RUN)',
@@ -338,7 +339,8 @@ GTAVC_HOOKS = {
     0x005f9d80: 'high frame rates: radio station name frames',
     0x00612160: 'high frame rates: millisecond timer time step',
 }
-GTAVC_OVERRIDES = {0x00561d00: 'CParticle::Update: 30 times a second at high frame rates (gta3_mode.c gta3_override)'}
+GTAVC_OVERRIDES = {0x00561d00: 'CParticle::Update: 30 times a second at high frame rates (gta3_mode.c gta3_override)',
+                   0x00571710: 'CBrightLights::RegisterOne: no boxes on car lights (gta3_mode.c car_light_box)'}
 GTASA_HOOKS = {
     0x0074daec: 'psSelectDevice: the launch window\'s video mode (GTA_MODE) before the saved one is read',
     0x0074d3be: 'GetVideoModeList: every shape of mode listed, not only 4:3, 5:4, 5:3, 16:10 and 16:9 (gta3_mode.c)',

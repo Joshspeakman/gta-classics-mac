@@ -1,0 +1,39 @@
+{
+  "name": "GTA Classics",
+  "bundle_id": "io.github.joshspeakman.gta-classics",
+  "release_repo": "Joshspeakman/gta-classics-macos",
+  "binary": "GTA Classics",
+  "icon_label": "GTA",
+  "style": "iron",
+  "title": "GTA CLASSICS",
+  "local_network": "The games don't use your local network.",
+  "launcher": [
+    "host/classics_launcher.m",
+    "host/classics_mods.m"
+  ],
+  "launcher_frameworks": [
+    "Cocoa",
+    "Metal"
+  ],
+  "resources": [
+    "tools/gta_restore.py"
+  ],
+  "games": [
+    {
+      "json": "gta3.json"
+    },
+    {
+      "json": "vc.json"
+    },
+    {
+      "json": "sa.json"
+    }
+  ],
+  "helpers": [
+    {
+      "name": "unshield",
+      "dir": "third_party/unshield",
+      "build": "clang -O2 -w -DHAVE_CONFIG_H -I . -I lib -I lib/md5 lib/*.c lib/md5/md5c.c src/unshield.c -lz -liconv -o \"$OUT\""
+    }
+  ]
+}

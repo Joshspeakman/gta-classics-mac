@@ -160,7 +160,7 @@ static NSScrollView *scroller(NSTableView *t, NSRect f)
     p.title = [NSString stringWithFormat:@"Mods — %@", self.title]; p.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     p.delegate = self; p.releasedWhenClosed = NO; p.minSize = NSMakeSize(620, 360); self.panel = p;
     NSView *cv = p.contentView;
-    NSTextField *head = [NSTextField labelWithString:@"Installed mods: the first one wins where two change the same file. Drop a zip, rar or 7z here to install it."];
+    NSTextField *head = [NSTextField labelWithString:@"Installed mods: the first one wins where two change the same file. Drop a zip, rar or 7z here to install it, or your disc's image to restore from it."];
     head.frame = NSMakeRect(16, 438, 690, 20); head.textColor = NSColor.secondaryLabelColor; head.autoresizingMask = NSViewMinYMargin | NSViewWidthSizable; [cv addSubview:head];
     NSTableView *t = [NSTableView new]; self.table = t;
     [t addTableColumn:column(@"on", @"On", 34)]; [t addTableColumn:column(@"name", @"Mod", 250)]; [t addTableColumn:column(@"kind", @"Status", 380)];
@@ -247,7 +247,7 @@ static NSScrollView *scroller(NSTableView *t, NSRect f)
 - (void)restoreDisc:(id)s
 {
     NSString *tool = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"gta_restore.py"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:tool]) { self.status.stringValue = @"This copy of the app has no restore tool: run install.sh again."; NSBeep(); return; }
+    if (![[NSFileManager defaultManager] fileExistsAtPath:tool]) { self.status.stringValue = @"This copy of the app has no restore tool: install it again."; NSBeep(); return; }
     NSOpenPanel *o = [NSOpenPanel openPanel]; o.canChooseDirectories = YES; o.message = [NSString stringWithFormat:@"Your original %@ PC disc: its image (.iso) or the mounted disc", self.title];
     [o beginSheetModalForWindow:self.panel completionHandler:^(NSModalResponse r) { if (r == NSModalResponseOK) [self restoreFrom:o.URL.path]; }];
 }
@@ -262,7 +262,20 @@ static NSScrollView *scroller(NSTableView *t, NSRect f)
         self.busy++; self.status.stringValue = @"Restoring from your disc… (the radio alone is about a gigabyte)";
         NSTask *t = [NSTask new]; t.executableURL = [NSURL fileURLWithPath:@"/usr/bin/python3"];
         t.arguments = @[@"-I", tool, self.gameTag, disc, self.gameDir ?: @"", dest];
-        NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy]; env[@"PATH"] = [@"/opt/homebrew/bin:/usr/local/bin:" stringByAppendingString:env[@"PATH"] ?: @"/usr/bin:/bin"]; t.environment = env;
+        NSMutableDictionary *env = [NSProcessInfo.processInfo.environment mutableCopy]; env[@"PATH"] = [@"/opt/homebrew/bin:/usr/local/bin:" stringByAppendingString:env[@"PATH"] ?: @"/usr/bin:/bin"];
+        NSString *res = NSBundle.mainBundle.resourcePath, *tk = [res stringByAppendingPathComponent:@"setup/toolkit.tar.xz"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:tk]) {
+            /* the downloaded app (make_suite.sh): no Homebrew or command line tools needed. Its own unshield (Resources/bin), and
+             * the Python that sets the games up, unpacked once into ~/Games/GTAClassics/.python */
+            NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Games/GTAClassics/.python"], *py = [dir stringByAppendingPathComponent:@"python/bin/python3"];
+            env[@"PATH"] = [NSString stringWithFormat:@"%@:%@", [res stringByAppendingPathComponent:@"bin"], env[@"PATH"]];
+            env[@"GTAC_PY"] = py; env[@"GTAC_PY_DIR"] = dir; env[@"GTAC_TOOLKIT"] = tk;
+            t.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
+            NSString *script = @"[ -x \"$GTAC_PY\" ] || { mkdir -p \"$GTAC_PY_DIR\" && /usr/bin/tar -xf \"$GTAC_TOOLKIT\" -C \"$GTAC_PY_DIR\" python && "
+                                "/usr/bin/xattr -r -d com.apple.quarantine \"$GTAC_PY_DIR\" 2>/dev/null; true; } && exec \"$GTAC_PY\" \"$@\"";
+            t.arguments = [@[@"-c", script, @"restore"] arrayByAddingObjectsFromArray:t.arguments];
+        }
+        t.environment = env;
         NSPipe *pipe = [NSPipe pipe]; t.standardOutput = pipe; t.standardError = pipe;
         t.terminationHandler = ^(NSTask *task) {
             NSString *out = [[NSString alloc] initWithData:[pipe.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
@@ -298,7 +311,12 @@ static NSScrollView *scroller(NSTableView *t, NSRect f)
 - (BOOL)tableView:(NSTableView *)t acceptDrop:(id<NSDraggingInfo>)info row:(NSInteger)r dropOperation:(NSTableViewDropOperation)op
 {
     NSArray<NSURL *> *urls = [info.draggingPasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    for (NSURL *u in urls) [self installPath:u.path name:u.lastPathComponent.stringByDeletingPathExtension source:u.path done:nil];
+    for (NSURL *u in urls) {
+        /* the original PC disc: its image, or the mounted disc itself: Restore from Disc (tools/gta_restore.py) */
+        BOOL mounted = [u.path.stringByDeletingLastPathComponent isEqualToString:@"/Volumes"];
+        if (mounted || [@[@"iso", @"img", @"cdr", @"dmg"] containsObject:u.pathExtension.lowercaseString]) { [self restoreFrom:u.path]; continue; }
+        [self installPath:u.path name:u.lastPathComponent.stringByDeletingPathExtension source:u.path done:nil];
+    }
     return urls.count > 0;
 }
 

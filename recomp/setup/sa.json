@@ -1,0 +1,119 @@
+{
+  "release_repo": "Joshspeakman/gta-classics-macos",
+  "tag_lowercase": true,
+  "cc_args": [
+    "-fPIC",
+    "-DRT_HOST_RC_INIT=UINT32_MAX"
+  ],
+  "rt_opt": "-O1",
+  "frameworks": [
+    "AppKit",
+    "GameController",
+    "Metal",
+    "QuartzCore",
+    "CoreText",
+    "CoreGraphics",
+    "CoreFoundation",
+    "AudioToolbox",
+    "AVFoundation",
+    "CoreMedia",
+    "CoreImage"
+  ],
+  "style": "iron",
+  "local_network": "The games don't use your local network.",
+  "name": "Grand Theft Auto: San Andreas",
+  "folder": "GTA San Andreas",
+  "binary": "GTASA",
+  "icon_label": "SA",
+  "version": "the Mac Steam release (app 12250)",
+  "where": "Your San Andreas from Steam (the Mac release, app 12250: its app, or the GTA San Andreas folder inside it)",
+  "minutes": 8,
+  "space_gb": 6,
+  "build_gb": 2,
+  "exe": "gta_sa.exe",
+  "exe_sha256": {
+    "345b26ed83a8bdc0ff7040a7e46b6025693364ed5c5f0748e34cdaa1e72e5181": {
+      "version": "Steam (Mac, 12250)",
+      "patch": [
+        [
+          "steamstub21.py",
+          "{exe}",
+          "{exe}"
+        ]
+      ]
+    }
+  },
+  "inside": [
+    "Contents/Resources/transgaming/c_drive/Program Files/Rockstar Games/GTA San Andreas"
+  ],
+  "required": [
+    "data",
+    "models",
+    "audio",
+    "anim",
+    "eax.dll",
+    "ogg.dll",
+    "vorbis.dll",
+    "vorbisfile.dll"
+  ],
+  "addons": [
+    {
+      "name": "msvcr71",
+      "into": "msvcr71.dll",
+      "look": [
+        "../../../windows/system32/msvcr71.dll"
+      ]
+    },
+    {
+      "name": "msvcp71",
+      "into": "msvcp71.dll",
+      "look": [
+        "../../../windows/system32/msvcp71.dll"
+      ]
+    }
+  ],
+  "libs": [
+    {
+      "file": "msvcr71.dll"
+    },
+    {
+      "file": "msvcp71.dll",
+      "rebase": "0x14000000"
+    },
+    {
+      "file": "vorbisfile.dll"
+    },
+    {
+      "file": "vorbis.dll",
+      "rebase": "0x11000000"
+    },
+    {
+      "file": "ogg.dll",
+      "rebase": "0x12000000"
+    },
+    {
+      "file": "eax.dll",
+      "rebase": "0x13000000"
+    }
+  ],
+  "lift_args": [
+    "--game",
+    "gtasa"
+  ],
+  "art": [
+    "gta_art.py",
+    "sa",
+    "{art}"
+  ],
+  "log": "GTASA",
+  "build": "./build_gtasa.sh \"$GAME\"",
+  "out": "work/gtasa",
+  "rt_cflags": [
+    "-DGTASA_EDITION"
+  ],
+  "host_cflags": [
+    "-DGTASA_EDITION"
+  ],
+  "title": "SAN ANDREAS",
+  "bundle_id": "io.github.joshspeakman.gta-classics"
+}

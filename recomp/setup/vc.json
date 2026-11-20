@@ -1,0 +1,75 @@
+{
+  "release_repo": "Joshspeakman/gta-classics-macos",
+  "tag_lowercase": true,
+  "cc_args": [
+    "-fPIC",
+    "-DRT_HOST_RC_INIT=UINT32_MAX"
+  ],
+  "rt_opt": "-O1",
+  "frameworks": [
+    "AppKit",
+    "GameController",
+    "Metal",
+    "QuartzCore",
+    "CoreText",
+    "CoreGraphics",
+    "CoreFoundation",
+    "AudioToolbox",
+    "AVFoundation",
+    "CoreMedia",
+    "CoreImage"
+  ],
+  "style": "iron",
+  "local_network": "The games don't use your local network.",
+  "name": "Grand Theft Auto: Vice City",
+  "folder": "Grand Theft Auto Vice City",
+  "binary": "GTAVC",
+  "icon_label": "VC",
+  "version": "the Windows release from Steam (app 12110, depot 12111)",
+  "where": "Your Vice City from Steam's Windows release (app 12110): on a Mac, Steam's console downloads it with download_depot 12110 12111 (the Mac release's copy carries SecuROM and can't be used)",
+  "minutes": 5,
+  "space_gb": 3,
+  "build_gb": 1,
+  "exe": "gta-vc.exe",
+  "exe_sha256": {
+    "8c2318d61bffaaff5e638449543dbf99ea932dca85f297c7190d2efd525b848f": {
+      "version": "Steam (Windows, 12110)",
+      "patch": [
+        [
+          "steamstub21.py",
+          "{exe}",
+          "{exe}"
+        ]
+      ]
+    }
+  },
+  "required": [
+    "data",
+    "models",
+    "Audio",
+    "txd",
+    "anim",
+    "Mss32.dll"
+  ],
+  "libs": [],
+  "lift_args": [
+    "--game",
+    "gtavc"
+  ],
+  "art": [
+    "gta_art.py",
+    "vc",
+    "{art}"
+  ],
+  "log": "GTAVC",
+  "build": "./build_gtavc.sh \"$GAME\"",
+  "out": "work/gtavc",
+  "rt_cflags": [
+    "-DGTAVC_EDITION"
+  ],
+  "host_cflags": [
+    "-DGTAVC_EDITION"
+  ],
+  "title": "VICE CITY",
+  "bundle_id": "io.github.joshspeakman.gta-classics"
+}

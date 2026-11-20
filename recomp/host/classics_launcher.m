@@ -65,6 +65,8 @@ void gcm_show(NSWindow *parent, NSString *title, NSString *gameTag, int gamebana
 
 @interface GCGame : NSObject
 @property const GameDef *def; @property BOOL installed;
+@property BOOL dropin;                                        /* the downloaded app (setup/<bin>.json): Play sets an unset game up */
+@property NSString *libDir;                                   /* the downloaded app: where setup put the game's library */
 @property NSString *game, *data, *built, *binPath, *exePath;   /* the game's folder, its data folder, the commit it was built from */
 @property NSImage *hero, *logo, *card;
 @end
@@ -269,7 +271,7 @@ static void stroke_rect(NSRect r, NSColor *c, CGFloat w) { [c setStroke]; NSBezi
     if (!g.installed) {                                                  /* a tag across the top */
         NSRect tag = NSMakeRect(NSMaxX(r) - 124, r.origin.y + 10, 114, 22);
         [[NSColor colorWithWhite:0 alpha:0.75] setFill]; fill_over(tag); stroke_rect(tag, [dim() colorWithAlphaComponent:0.6], 1);
-        draw_text(@"NOT INSTALLED", heavy(12), dim(), NSMakeRect(tag.origin.x, tag.origin.y + 3, tag.size.width, 16), NSTextAlignmentCenter, nil, 2);
+        draw_text(g.dropin ? @"NOT SET UP" : @"NOT INSTALLED", heavy(12), dim(), NSMakeRect(tag.origin.x, tag.origin.y + 3, tag.size.width, 16), NSTextAlignmentCenter, nil, 2);
     }
     stroke_rect(r, sel ? accent() : hot ? [accent() colorWithAlphaComponent:0.8] : [text_c() colorWithAlphaComponent:0.22], sel ? 3 : hot ? 2 : 1);
 }
@@ -316,6 +318,7 @@ static void stroke_rect(NSRect r, NSColor *c, CGFloat w) { [c setStroke]; NSBezi
 - (NSString *)cardHint:(NSInteger)i
 {
     GCGame *g = self.games[i];
+    if (!g.installed && g.dropin) return [NSString stringWithFormat:@"%s isn't set up yet: Set Up builds it from your own copy", g.def->place];
     if (!g.installed) return [NSString stringWithFormat:@"%s isn't installed: ./install.sh --games %s", g.def->place, g.def->id];
     return [NSString stringWithFormat:@"%s · double-click or Return to play", g.def->title];
 }
@@ -352,6 +355,7 @@ static void stroke_rect(NSRect r, NSColor *c, CGFloat w) { [c setStroke]; NSBezi
     [accent() setFill]; NSRectFill(NSMakeRect(60, 240, 4, 38));
     draw_text(@"NATIVE FOR APPLE SILICON", heavy(19), text_c(), NSMakeRect(74, 238, 420, 24), NSTextAlignmentLeft, sh, 2.5);
     NSString *tag = g.installed ? [NSString stringWithFormat:@"%s on Metal · your Steam copy, recompiled", g.def->place]
+                                : g.dropin ? @"Not set up yet · Set Up finds your Steam copy, or drop its folder on the app"
                                 : [NSString stringWithFormat:@"Not installed · ./install.sh --games %s", g.def->id];
     draw_text(tag, body(13, NO), accent(), NSMakeRect(74, 261, 520, 20), NSTextAlignmentLeft, sh, 0.3);
     /* the games */
@@ -366,7 +370,7 @@ static void stroke_rect(NSRect r, NSColor *c, CGFloat w) { [c setStroke]; NSBezi
     NSString *hint = [self currentHint];
     if (hint.length) draw_text(hint, body(12.5, NO), dim(), NSMakeRect(60, H - 58, 420, 36), NSTextAlignmentLeft, sh, 0.2);
     [self drawButton:self.quitRect title:self.open ? @"BACK" : @"QUIT" code:self.open ? HIT_BACK : HIT_QUIT primary:NO enabled:YES];
-    [self drawButton:self.playRect title:@"PLAY" code:HIT_PLAY primary:YES enabled:g.installed];
+    [self drawButton:self.playRect title:g.installed || !g.dropin ? @"PLAY" : @"SET UP" code:HIT_PLAY primary:YES enabled:g.installed || g.dropin];
 }
 @end
 
@@ -381,7 +385,9 @@ static NSString *update_check(NSString *updater)     /* the newest commit of the
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_global_queue(0, 0), ^{ if (t.running) [t terminate]; });
     NSData *d = [p.fileHandleForReading readDataToEndOfFile]; [t waitUntilExit];
     NSString *out = [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    return t.terminationStatus == 0 && out.length >= 40 ? [out substringToIndex:40] : nil;
+    if (t.terminationStatus != 0 || !out.length) return nil;
+    if (out.length >= 40) return [out substringToIndex:40];   /* a commit (an app built from source) */
+    return [out rangeOfCharacterFromSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].location == NSNotFound ? out : nil;   /* a release's tag (the downloaded app) */
 }
 static NSArray<NSDictionary *> *update_choice(int state, NSString *branch, NSString *built, NSString *latest)
 {
@@ -396,6 +402,12 @@ static NSArray<NSDictionary *> *update_choice(int state, NSString *branch, NSStr
 }
 static NSString *update_phase(NSString *line, NSString *branch)
 {
+    if ([branch isEqualToString:@"release"]) {   /* the downloaded app's updater (setup/update.sh) */
+        if ([line hasPrefix:@"== downloading "]) return [NSString stringWithFormat:@"Downloading %@ from GitHub", [line substringFromIndex:15]];
+        if ([line hasPrefix:@"== unpacking"]) return @"Unpacking it";
+        if ([line hasPrefix:@"== installing"]) return @"Installing the new app";
+        return nil;
+    }
     if ([line hasPrefix:@"== fetching"]) return @"Downloading the update from GitHub";
     if ([line hasPrefix:[NSString stringWithFormat:@"== %@:", branch]]) return [@"Got " stringByAppendingString:[line substringFromIndex:branch.length + 4]];
     if ([line hasPrefix:@"== recompiling "]) {                          /* "== recompiling <game> from <folder> (...)" */
@@ -464,6 +476,8 @@ static BOOL update_run(NSWindow *parent, NSString *updater, NSString *branch, NS
 }
 
 // ---------------------------------------------------------------- images
+static NSString *suite_release;
+static NSArray<NSString *> *pending_open;   /* folders dropped on the app before its window was made */   /* the downloaded app: its release's tag (its updater follows releases) */
 static NSImage *image_at(NSArray<NSString *> *dirs, NSString *name)
 {
     for (NSString *d in dirs) { NSImage *i = [[NSImage alloc] initWithContentsOfFile:[d stringByAppendingPathComponent:name]]; if (i.size.width > 16) return i; }
@@ -587,6 +601,19 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
         g.binPath = [macos stringByAppendingPathComponent:e[@"bin"] ?: @(d->bin)];
         g.exePath = [res stringByAppendingPathComponent:e[@"exe"] ?: @(d->exe)];
         g.installed = e && [fm isExecutableFileAtPath:g.binPath] && [fm fileExistsAtPath:g.exePath];
+        NSData *sj = [NSData dataWithContentsOfFile:[res stringByAppendingPathComponent:[NSString stringWithFormat:@"setup/%s.json", d->bin]]];
+        NSDictionary *sc = sj ? [NSJSONSerialization JSONObjectWithData:sj options:0 error:nil] : nil;
+        if (sc) {   /* the downloaded app (make_suite.sh): each game set up by its own binary into ~/Games/<folder> (setup/setup_ui.m) */
+            NSString *root = [NSHomeDirectory() stringByAppendingPathComponent:[@"Games" stringByAppendingPathComponent:sc[@"folder"]]];
+            g.dropin = YES; g.data = root; g.game = [root stringByAppendingPathComponent:@"game-files"];
+            g.libDir = [root stringByAppendingPathComponent:@"recomp"]; g.exePath = [g.libDir stringByAppendingPathComponent:@(d->exe)];
+            g.binPath = [macos stringByAppendingPathComponent:@(d->bin)]; g.built = sc[@"release"] ?: @"";
+            NSData *rj = [NSData dataWithContentsOfFile:[g.libDir stringByAppendingPathComponent:@"ready.json"]];
+            NSDictionary *ready = rj ? [NSJSONSerialization JSONObjectWithData:rj options:0 error:nil] : nil;
+            g.installed = [ready[@"code"] isEqual:sc[@"code"]] && [fm fileExistsAtPath:[g.libDir stringByAppendingPathComponent:@"libgame.dylib"]]
+                          && [fm fileExistsAtPath:g.exePath] && [fm isExecutableFileAtPath:g.binPath];   /* else Set Up (re)builds it */
+            suite_release = g.built;
+        }
         NSArray *art = @[[res stringByAppendingPathComponent:[@"art" stringByAppendingPathComponent:@(d->id)]],
                          [self.home stringByAppendingPathComponent:[@"art" stringByAppendingPathComponent:@(d->id)]], [g.data stringByAppendingPathComponent:@"art"]];
         g.hero = image_at(art, @"hero.jpg"); g.card = image_at(art, @"shot1.jpg");
@@ -790,6 +817,7 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
     if (getenv("GTAC_LAUNCHER_PLAY")) dispatch_async(dispatch_get_main_queue(), ^{ [ws play]; });   /* development: Play at once */
     if (getenv("GTAC_MODS_OPEN")) dispatch_async(dispatch_get_main_queue(), ^{ mods.activate();   /* development: the Mods window (and its browser) */
         if (getenv("GTAC_MODS_BROWSE")) dispatch_async(dispatch_get_main_queue(), ^{ void gcm_browse(void); gcm_browse(); }); });
+    if (pending_open) { NSArray *p = pending_open; pending_open = nil; dispatch_async(dispatch_get_main_queue(), ^{ [ws application:NSApp openFiles:p]; }); }
 }
 - (void)setupUpdates
 {
@@ -797,6 +825,7 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
     NSString *updater = [NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"update"];
     if (![[NSFileManager defaultManager] isExecutableFileAtPath:updater]) updater = nil;
     NSString *branch = info[@"GTACBranch"] ?: @"main", *built = info[@"GTACBuilt"] ?: @"";
+    if (suite_release) { branch = @"release"; built = suite_release; }   /* the downloaded app (setup/update.sh) */
     GCTile *u = [GCTile new]; u.title = @"Updates"; self.updates = u;
     __block int state = updater ? UPD_CHECKING : UPD_NONE; __block NSString *latest = nil;
     u.choices = update_choice(state, branch, built, nil);
@@ -816,7 +845,10 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
         if (state == UPD_CHECKING || state == UPD_NONE) return;
         if (state != UPD_AVAILABLE) { check(); return; }
         NSAlert *a = alert([NSString stringWithFormat:@"Update to the newest %@?", [branch isEqualToString:@"nightly"] ? @"Nightly" : @"version"],
-                           [NSString stringWithFormat:@"The %@ branch (%@) is downloaded from GitHub and every installed game is rebuilt from your own copy, "
+                           [branch isEqualToString:@"release"]
+                           ? [NSString stringWithFormat:@"%@ is downloaded from GitHub and replaces this app. Your games, saves and settings are kept; "
+                              "a game whose code changed is rebuilt from your copy when you next play it.", latest]
+                           : [NSString stringWithFormat:@"The %@ branch (%@) is downloaded from GitHub and every installed game is rebuilt from your own copy, "
                             "which takes a few minutes for each. Your saves and settings are kept. The app restarts when it is done.", branch, short_commit(latest)]);
         [a addButtonWithTitle:@"Update"]; [a addButtonWithTitle:@"Cancel"];
         if ([a runModal] != NSAlertFirstButtonReturn) return;
@@ -830,6 +862,43 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
     };
 }
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)a { return YES; }
+/* the downloaded app: a game's own binary shows its setup window (Drop, Choose, Search; setup/setup_ui.m), given a folder
+ * when one was dropped on the app, and comes back here when the game is ready (DS_SUITE) */
+- (void)setUp:(GCGame *)g folder:(NSString *)folder
+{
+    [self save];
+    setenv("DS_SUITE", NSBundle.mainBundle.executablePath.fileSystemRepresentation, 1);
+    if (folder) setenv("DS_SETUP_FOLDER", folder.fileSystemRepresentation, 1); else unsetenv("DS_SETUP_FOLDER");
+    const char *bin = g.binPath.fileSystemRepresentation; char *const av[] = {(char *)bin, NULL};
+    execv(bin, av);
+    [alert(@"Setup did not start", @(strerror(errno))) runModal];
+}
+/* which game a dropped folder holds: its executable at most 4 levels down, store wrapper apps included (TransGaming's) */
+static BOOL holds_exe(NSString *dir, const char *exe, int depth)
+{
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *n in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+        if ([n caseInsensitiveCompare:@(exe)] == NSOrderedSame) return YES;
+        NSString *sub = [dir stringByAppendingPathComponent:n]; BOOL isdir = NO;
+        if (depth < 4 && ![n hasPrefix:@"."] && [fm fileExistsAtPath:sub isDirectory:&isdir] && isdir) {
+            if ([n.pathExtension isEqualToString:@"app"]) { NSString *tg = [sub stringByAppendingPathComponent:@"Contents/Resources/transgaming/c_drive"];
+                if ([fm fileExistsAtPath:tg] && holds_exe(tg, exe, -4)) return YES; continue; }
+            if (holds_exe(sub, exe, depth + 1)) return YES;
+        }
+    }
+    return NO;
+}
+- (void)application:(NSApplication *)app openFiles:(NSArray<NSString *> *)paths
+{
+    if (!self.view.games) { pending_open = paths; return; }          /* the app opened by the drop: once its window is up */
+    for (NSString *p in paths) for (GCGame *g in self.view.games) {
+        if (!g.dropin || !holds_exe(p, g.def->exe, 0)) continue;
+        if (g.installed) { [self.view choose:(NSInteger)[self.view.games indexOfObject:g]]; return; }   /* set up already: its card */
+        [self setUp:g folder:p]; return;
+    }
+    [alert(@"That isn't one of the games", @"Drop the folder of your Steam copy of Grand Theft Auto III, Vice City or San Andreas on the app.") runModal];
+    [app replyToOpenOrPrint:NSApplicationDelegateReplyFailure];
+}
 - (NSDictionary *)choices
 {
     return @{@"game": @(GAMES[self.view.game].id), @"display": val(self.display), @"notch": val(self.notch), @"resolution": val(self.resolution), @"vsync": val(self.vsync), @"wide": val(self.wide), @"hud": val(self.hud), @"aa": val(self.aa), @"aniso": val(self.aniso), @"depth": val(self.depth), @"fps": val(self.fps), @"per_game": self.perGame ?: @{}, @"light": val(self.light), @"controls": val(self.controls), @"look": val(self.look), @"invert": val(self.invert)};
@@ -854,6 +923,7 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
 {
     [self save];
     GCGame *g = self.view.chosen; NSFileManager *fm = NSFileManager.defaultManager;
+    if (!g.installed && g.dropin) { [self setUp:g folder:nil]; return; }
     if (!g.installed) {
         [alert([NSString stringWithFormat:@"%s isn't installed", g.def->title],
                [NSString stringWithFormat:@"Install it from your Steam copy with the project's installer:\n\n./install.sh --games %s\n\n"
@@ -892,6 +962,7 @@ static NSAlert *alert(NSString *msg, NSString *info) { NSAlert *a = [NSAlert new
     NSMutableDictionary *all = [NSProcessInfo.processInfo.environment mutableCopy];
     [all addEntriesFromDictionary:env];
     [all addEntriesFromDictionary:@{@"GTAC_PLAY_BIN": g.binPath, @"GTAC_PLAY_EXE": g.exePath, @"GTAC_PLAY_GAME": g.game, @"GTAC_PLAY_DATA": g.data}];
+    if (g.libDir) all[@"GTAC_PLAY_LIB"] = g.libDir;                     /* the downloaded app: the game's library, set up in its folder */
     [all removeObjectForKey:@"GTAC_LAUNCHER_PLAY"];
     NSWorkspaceOpenConfiguration *cfg = [NSWorkspaceOpenConfiguration configuration];
     cfg.createsNewApplicationInstance = YES; cfg.environment = all; cfg.activates = YES;
@@ -923,6 +994,8 @@ static void exec_game(void)
     for (int k = 0; k < 4; k++) { keep[k] = strdup(getenv(names[k])); }
     argv[0] = keep[0]; argv[2] = keep[1]; argv[4] = keep[2]; argv[6] = keep[3];
     for (int k = 0; k < 4; k++) unsetenv(names[k]);
+    const char *lib = getenv("GTAC_PLAY_LIB");                        /* the downloaded app: bind the game's own library (setup/make_release.sh) */
+    if (lib) { setenv("DYLD_LIBRARY_PATH", lib, 1); unsetenv("GTAC_PLAY_LIB"); }
     execv(argv[0], (char *const *)argv);
     fprintf(stderr, "GTA Classics: %s did not start: %s\n", argv[0], strerror(errno));
 }

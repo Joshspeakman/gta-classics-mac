@@ -44,13 +44,17 @@ stick turns the camera (up looks up).
 - **GTA III's and Vice City's car camera.** The PC games have no free camera in vehicles. With Modern, the right stick
   sideways swings the camera round the car, and once it's let go the camera drifts back behind as the car moves (their
   car camera is a "string" that is pulled along behind the car); down looks behind.
+- **The mouse (Modern).** On foot it is each game's own free mouse camera. In GTA III's and Vice City's vehicles it now
+  looks round the car as in today's games: sideways swings the camera round, up and down raise and lower it, and the
+  camera stays where the mouse leaves it until the mouse has been still for a moment and the car is moving, then eases
+  back behind. San Andreas has its own mouse camera in vehicles (*Steer with Mouse* is held off under Modern).
 - **Look Speed and Invert Look** (launcher rows, kept for each game): the camera's speed (Slow, Normal, Fast, Very
   Fast: `GTA_STICK_LOOK` 900, 1400, 2000, 2800 counts a second; the games' own mouse sensitivity also applies) and up
   and down the other way round (`GTA_STICK_INVERT=1`). Invert also applies to Classic, where GTA III's and Vice City's
   own stick look has up looking down.
 - **Left stick: moving.** GTA III's PC controls turn the player with left and right when the mouse camera is on; with
-  Modern it moves him as on the PS2, toward the stick's direction from the camera (while aiming with LT, the PC
-  control keeps him facing where the camera looks). Vice City and San Andreas already move that way.
+  Modern it moves him as on the PS2, toward the stick's direction from the camera (while aiming with LT, or with the
+  mouse's fire or aim button held, the PC control keeps him facing where the camera looks). Vice City and San Andreas already move that way.
 
 | Controller | On foot | Cars, motorbikes, boats | Bicycles (San Andreas) | Aircraft (San Andreas) |
 |---|---|---|---|---|

@@ -248,6 +248,13 @@ PLANS = {
         ('night rain', ['cheat:CATSANDDOGS'], 10, []),
         ('dawn', ['cheat:ALOVELYDAY', hold((0xa0fb75, 6))], 8, []),
     ],
+    # Vice City's car lights at night (no CBrightLights boxes on the head and tail lights): in the Admiral, then beside it
+    'vc-carlights': [
+        ('night, behind the car', ['cheat:ALOVELYDAY', hold((0xa0fb75, 23))], 10, []),
+        ('frame log', ['framelog'], 2, []),
+        ('on foot beside it', ['key:70'], 6, []),
+        ('frame log on foot', ['framelog'], 2, []),
+    ],
     # GTA III: CClock hours 0x96e0df; weather cheats
     'gta3-effects': [
         ('start (night, in the car)', [], 3, []),
